@@ -1,15 +1,17 @@
 from datetime import UTC, datetime, timedelta
+import logging
 from uuid import UUID
 
 import bcrypt
 import jwt
 
-from config import ACCESS_TOKEN_EXPIRE_MINUTES, JWT_SECRET_KEY
+from config import ACCESS_TOKEN_EXPIRE_MINUTES, JWT_IAT_LEEWAY_SECONDS, JWT_SECRET_KEY
 
 if len(JWT_SECRET_KEY.encode("utf-8")) < 32:
     raise RuntimeError("Set JWT_SECRET_KEY to a random secret of at least 32 bytes in .env.")
 
 ALGORITHM = "HS256"
+logger = logging.getLogger("taskhub.auth")
 
 
 def hash_password(password: str) -> str:
@@ -42,6 +44,15 @@ def create_access_token(user_id: UUID) -> str:
 def decode_access_token(token: str) -> UUID:
     payload = jwt.decode(
         token, JWT_SECRET_KEY, algorithms=[ALGORITHM],
-        options={"require": ["sub", "iat", "exp"]},
+        # Validate iat below with a small, bounded clock tolerance. Keep PyJWT's
+        # signature, exp and nbf checks strict; global leeway would extend expiry.
+        options={"require": ["sub", "iat", "exp"], "verify_iat": False},
     )
+    issued_at = payload["iat"]
+    if not isinstance(issued_at, int) or isinstance(issued_at, bool):
+        raise jwt.InvalidIssuedAtError("Issued At claim (iat) must be an integer.")
+    skew = issued_at - datetime.now(UTC).timestamp()
+    if skew > JWT_IAT_LEEWAY_SECONDS:
+        logger.warning("JWT issued in future: clock_skew_seconds=%.3f", skew)
+        raise jwt.ImmatureSignatureError("The token is not yet valid (iat)")
     return UUID(payload["sub"])

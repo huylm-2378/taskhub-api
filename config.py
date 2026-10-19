@@ -28,6 +28,9 @@ if DB_POOL_SIZE < 1 or DB_MAX_OVERFLOW < 0 or DB_POOL_TIMEOUT < 1:
 
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+JWT_IAT_LEEWAY_SECONDS = int(os.getenv("JWT_IAT_LEEWAY_SECONDS", "5"))
+if not 0 <= JWT_IAT_LEEWAY_SECONDS <= 30:
+    raise ValueError("JWT_IAT_LEEWAY_SECONDS must be between 0 and 30.")
 if ACCESS_TOKEN_EXPIRE_MINUTES < 1:
     raise ValueError("ACCESS_TOKEN_EXPIRE_MINUTES must be positive.")
 

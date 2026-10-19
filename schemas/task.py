@@ -31,6 +31,26 @@ class TaskAssign(InputSchema):
     assignee_id: UUID
 
 
+class TaskUpdate(InputSchema):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=10000)
+    status: TaskStatus | None = None
+    priority: int | None = Field(default=None, ge=1, le=5)
+    due_date: AwareDatetime | None = None
+
+    @field_validator("title", "status", "priority")
+    @classmethod
+    def reject_null_required_fields(cls, value):
+        if value is None:
+            raise ValueError("Field cannot be null")
+        return value
+
+    @field_validator("due_date")
+    @classmethod
+    def normalize_due_date(cls, value: datetime | None) -> datetime | None:
+        return TaskFields.normalize_due_date(value)
+
+
 class ProjectTaskCreate(TaskFields):
     tag_ids: list[UUID] = Field(default_factory=list, max_length=100)
 

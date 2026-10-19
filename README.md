@@ -123,7 +123,7 @@ nối tính riêng cho mỗi worker: `DB_POOL_SIZE + DB_MAX_OVERFLOW`. Dependenc
 | POST / GET | `/api/tags` | Tạo / liệt kê tag |
 | PATCH | `/api/tags/{tag_id}` | Cập nhật tên tag |
 | POST / GET | `/api/tasks` | Tạo / liệt kê task |
-| GET | `/api/tasks/{task_id}` | Xem task |
+| GET / PATCH / DELETE | `/api/tasks/{task_id}` | Xem, cập nhật hoặc xóa task theo quyền |
 | POST | `/api/tasks/{task_id}/bookmark` | Bookmark task cho user đang đăng nhập |
 | POST | `/api/tasks/{task_id}/assign` | Giao lại task cho user (PM/Admin) |
 | POST | `/api/tasks/{task_id}/comments` | Thêm comment với tác giả từ JWT |
@@ -165,15 +165,19 @@ Lấy `id` của Project, dùng khi tạo Task:
 ```
 
 `assignee_id` và `due_date` có thể bỏ qua. Nếu gửi `due_date`, phải kèm múi giờ.
+Khi tạo task qua một trong hai endpoint, người được giao phải đang hoạt động;
+user không tồn tại trả 404, user bị khóa trả 409 và không lưu task.
 Priority nằm trong khoảng 1–5. API trả 201 khi tạo thành công, 404 khi không tìm
 thấy tài nguyên, 409 khi xung đột và 422 khi dữ liệu không hợp lệ.
 
 Phạm vi hiện tại: xác thực JWT, phân quyền admin/chủ project, tạo/xem User,
 Project, Task, Tag, bookmark/giao lại task, thêm/sửa/xóa comment, cập nhật
-Project/Tag và tài khoản hiện tại.
+Project/Tag và tài khoản hiện tại, cập nhật thông tin/trạng thái và xóa Task.
 Các API đọc project/task vẫn dùng chung cho tài khoản đang hoạt động;
 chưa có mô hình project riêng tư hoặc thành viên project. Chưa triển khai API
-xóa User/Project/Task/Tag. Các đường dẫn `/tasks/...` cũ vẫn là ví dụ mock công khai,
+xóa User/Project/Tag. Task hỗ trợ TODO → IN_PROGRESS → DONE qua PATCH;
+quyền và quy tắc chuyển trạng thái được mô tả trong Bài 6.
+Các đường dẫn `/tasks/...` cũ vẫn là ví dụ mock công khai,
 nằm trong `routers/examples.py`.
 
 ## Thực hành schema và Swagger UI
@@ -332,6 +336,17 @@ Bấm **Logout** trong Authorize rồi gọi API dữ liệu để thấy 401. T
 đăng nhập lại; bài này chưa có refresh token, thu hồi token hoặc đổi/reset mật khẩu.
 Logout ở Swagger chỉ xóa token khỏi giao diện, không thu hồi token đã phát hành.
 
+`JWT_IAT_LEEWAY_SECONDS` mặc định `5`, nhận giá trị 0–30: cho phép `iat` (thời điểm
+phát hành) đi trước đồng hồ kiểm tra tối đa từng đó giây để chịu được lệch đồng
+hồ nhỏ hoặc đồng hồ vừa lùi. Đặt 0 để kiểm tra tuyệt đối. Chữ ký, thuật toán,
+claim bắt buộc và `exp`/`nbf` vẫn được kiểm tra nghiêm ngặt; token hết hạn không
+được thêm thời gian sống. `iat` phải là số nguyên. Khi vượt ngưỡng, API trả 401
+và log `clock_skew_seconds`, không ghi token hoặc secret. Các server vẫn cần
+đồng bộ giờ bằng NTP. Test đồng hồ cố định trong `tests/test_jwt_clock.py` tái
+hiện lỗi `ImmatureSignatureError` khi lùi 2 giây trước bản sửa, kiểm tra biên
+5/6 giây và xác nhận token hết hạn/tương lai xa vẫn bị từ chối.
+Tham khảo [PyJWT claims validation](https://pyjwt.readthedocs.io/en/stable/api.html).
+
 Các test auth dùng JWT và dependency thật, kiểm tra toàn bộ route được bảo vệ,
 token sai chữ ký/thuật toán/hết hạn/thiếu claim, không lộ hash, cập nhật đúng user,
 rollback khi trùng username/email và một luồng tạo project/tag/task đã đăng nhập.
@@ -458,6 +473,38 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8000/api/tasks/$TASK_ID/comments/$COMMENT_ID"
 ```
 
+### Cập nhật và xóa task
+
+`PATCH /api/tasks/{task_id}` trả 200 với task sau cập nhật. PM của project hoặc
+Admin được sửa `title`, `description`, `priority`, `due_date`, `status`.
+Người được giao task chỉ được gửi `status`; user khác nhận 403. Quyền được lấy
+lại từ task/project hiện tại, nên người đã bị giao lại task hoặc chuyển chủ
+project không giữ quyền cũ. Tài khoản bị khóa vẫn bị từ chối.
+
+- Bỏ qua trường để giữ nguyên. PM/Admin gửi `{}` giữ nguyên task.
+- `description: null` hoặc `due_date: null` xóa giá trị tương ứng.
+- `title`, `priority`, `status` không nhận `null`; deadline phải kèm timezone.
+- Không nhận `project_id`, `assignee_id`, `tag_ids` hoặc trường thừa. Dùng
+  endpoint `/assign` riêng để giao task.
+- Chuyển trạng thái theo TODO → IN_PROGRESS → DONE. Gửi lại trạng thái hiện tại
+  là hợp lệ; bỏ qua một bước hoặc quay lùi trả 409, không lưu một phần body.
+  API tạo task giữ tương thích với các trạng thái đầu vào đã hỗ trợ; PATCH
+  áp dụng quy tắc trên từ trạng thái đang lưu.
+
+```bash
+curl -X PATCH -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"status":"IN_PROGRESS"}' "http://127.0.0.1:8000/api/tasks/$TASK_ID"
+curl -X PATCH -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"status":"DONE"}' "http://127.0.0.1:8000/api/tasks/$TASK_ID"
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8000/api/tasks/$TASK_ID"
+```
+
+`DELETE /api/tasks/{task_id}` chỉ dành cho PM/Admin, trả 204 không có body.
+Task không tồn tại hoặc xóa lại trả 404. Xóa task đồng thời xóa comment, bookmark
+và liên kết tag; giữ nguyên tag, project, user và task khác. Đây là xóa vĩnh viễn.
+Cả hai nghiệp vụ dùng transaction và khóa hàng như `/assign`, không cần migration.
+
 ### Ranh giới transaction
 
 Router kiểm tra schema và xác thực, rồi gọi `services/task_interactions.py`.
@@ -477,7 +524,7 @@ tra tài nguyên, quyền và ghi dữ liệu trên cùng session, chỉ commit 
 
 Các test trong `tests/test_task_interactions.py` kiểm tra API bằng JWT thật,
 ma trận quyền, comment sai task, dữ liệu đầu vào và trạng thái đã lưu. Test
-transaction gây lỗi sau flush hoặc trước commit cho cả bốn nghiệp vụ, xác nhận
+transaction gây lỗi sau flush hoặc trước commit cho cả sáu nghiệp vụ, xác nhận
 DB không lưu thay đổi dở dang và session vẫn dùng lại được sau rollback.
 Test chạy trên SQLite tạm; SQLite không thực thi khóa hàng `FOR UPDATE`, nên
 bộ test này không xác nhận hành vi tranh chấp khóa đồng thời trên PostgreSQL.
@@ -554,6 +601,49 @@ chọn đúng người nhận, rollback không tạo job, SMTP lỗi không mấ
 hình STARTTLS/SSL. SMTP được giả lập nên không gửi email thật. `TestClient` chờ
 background task hoàn tất trước khi trả kết quả cho test; test dùng sự kiện ASGI
 để xác nhận response đã được gửi trước khi bắt đầu gửi email.
+
+### Kiểm chứng SMTP thật bằng Mailpit cục bộ
+
+Profile `mail` cung cấp [Mailpit](https://mailpit.axllent.org/docs/install/docker/):
+SMTP nhận thư ở cổng 1025, hộp thư web ở 8025, chỉ publish trên localhost.
+Thư được nhận qua kết nối SMTP thật và giữ trong Mailpit; không chuyển tiếp
+ra Gmail/Outlook hoặc người dùng thật. Trong `.env`, cấu hình cho app Docker:
+
+```dotenv
+EMAIL_ENABLED=true
+SMTP_HOST=mailpit
+SMTP_PORT=1025
+SMTP_USERNAME=
+SMTP_PASSWORD=
+SMTP_FROM=taskhub@example.com
+SMTP_USE_TLS=false
+SMTP_USE_SSL=false
+```
+
+```bash
+docker compose --profile mail up -d --build --wait
+```
+
+Mở <http://127.0.0.1:8025>, rồi tạo comment bằng một user khác chủ project/người
+được giao task. Mỗi người nhận đủ điều kiện có một thư riêng. Với `make dev`,
+đổi `SMTP_HOST=127.0.0.1` và chỉ chạy `docker compose --profile mail up -d mailpit`.
+Đổi cổng host bằng `MAILPIT_HTTP_PORT`/`MAILPIT_SMTP_PORT` nếu đang bị chiếm;
+app Docker vẫn dùng `mailpit:1025`.
+
+Test tích hợp dùng database tạm và kết nối SMTP loopback, không mock `smtplib`.
+Nó tạo comment qua API rồi đọc hộp thư Mailpit qua HTTP để xác nhận người nhận,
+nội dung tiếng Việt và comment ID. Có thêm test kết nối SMTP bị từ chối để
+kiểm tra comment vẫn được commit và response vẫn là 201:
+
+```bash
+MAILPIT_HTTP_URL=http://127.0.0.1:8025 MAILPIT_SMTP_PORT=1025 \
+  venv/bin/python3 -m pytest -q tests/test_smtp_delivery.py
+```
+
+Đặt cùng hai biến môi trường khi chạy toàn bộ test để bật kiểm thử gửi thư.
+Nếu không đặt `MAILPIT_HTTP_URL`, chỉ test gửi thư tới Mailpit được skip.
+Đây là xác minh SMTP cục bộ; gửi tới nhà cung cấp bên ngoài cần credentials và
+địa chỉ nhận thử riêng, cùng cấu hình TLS tương ứng.
 
 ### Redis cache danh sách tag (tùy chọn)
 
@@ -734,6 +824,48 @@ kiểm tra request ID, lỗi 500 có CORS, thông tin trace và loại bỏ dữ
 venv/bin/python3 -m pytest -q tests/test_deployment.py
 venv/bin/python3 -m pytest -q
 ```
+
+## Final Review — 19/10/2026
+
+Đã rà soát mã nguồn, chạy toàn bộ **172 test**, gồm SMTP thật tới Mailpit, và
+**74 kiểm tra HTTP** của đợt review ban đầu trên stack
+Docker riêng với PostgreSQL và Redis thật. Stack review dùng credentials, cổng
+và volume tạm; đã dọn sau kiểm tra, không sử dụng database đang phát triển.
+Đợt kiểm tra bổ sung chạy luồng cập nhật trạng thái → email SMTP → xóa task
+trên PostgreSQL/Mailpit trong Docker, gồm hai request cập nhật cùng trạng thái
+đồng thời (cả hai trả 200), hai request xóa đồng thời (204/404), và kiểm tra
+cascade comment/bookmark/liên kết tag trong database.
+
+| Luồng | Kết quả |
+| --- | --- |
+| Build → DB healthy → migration → API healthy | Đạt; `alembic check` khớp schema PostgreSQL |
+| Đăng ký → đăng nhập → `/me`; username/email trùng, mật khẩu sai | Đạt; dữ liệu trả về không chứa password/hash |
+| USER/Admin/chủ project; tài khoản bị khóa; chuyển chủ project | Đạt; quyền được đọc lại từ DB dù JWT chưa hết hạn |
+| Project → tag → task; quan hệ, UTC, filter, phân trang | Đạt trên PostgreSQL |
+| Giao task → comment → sửa/xóa theo quyền → bookmark lặp | Đạt; bookmark không tạo bản ghi trùng |
+| CORS preflight, origin lạ, JWT bắt buộc, request ID | Đạt; cả lỗi 500 có CORS cho origin hợp lệ |
+| Redis cache, JSON hỏng, invalidation, Redis dừng/phục hồi | Đạt; cache lỗi quay về DB |
+| DB dừng/phục hồi, log lỗi, restart API | Đạt; 500 không lộ chi tiết DB, log có trace/request ID, dữ liệu còn nguyên |
+| Email nền | Đạt: SMTP thật tới Mailpit, xác minh người nhận/nội dung; lỗi kết nối không mất comment |
+| Vòng đời task | PATCH theo trạng thái và quyền, DELETE cascade, rollback khi lỗi đều có test |
+| JWT lệch giờ | Test lùi 2 giây và biên dung sai đạt; hết hạn/nbf vẫn kiểm tra nghiêm ngặt |
+
+**Lỗi đã sửa trong review:** cả `POST /api/tasks` và
+`POST /api/projects/{project_id}/tasks` từng cho phép tạo task giao cho user bị
+khóa, trong khi endpoint `/assign` từ chối. Hai đường tạo task giờ trả 409 và
+không lưu dữ liệu; đã thêm hai regression test tái hiện lỗi trước khi sửa.
+
+**Giới hạn còn lại:** chưa có API xóa User/Project/Tag; project/task vẫn được đọc chung bởi
+các tài khoản đang hoạt động. Đây là phạm vi ứng dụng học tập hiện có, chưa phải
+quy trình quản lý task đầy đủ cho nhiều nhóm riêng tư. Profile chưa phân trang,
+chưa có refresh token/thu hồi token và chưa kiểm thử tải lớn.
+`/health` vẫn chỉ là liveness; khi DB dừng, endpoint
+này vẫn trả 200. TLS/domain và backup trên server thật chưa được kiểm chứng.
+
+Đã tái hiện và xử lý JWT bị từ chối khi đồng hồ lùi nhỏ bằng regression test;
+chưa có đủ log để kết luận đây chắc chắn là nguyên nhân của các lượt lỗi cũ.
+Log độ lệch mới giúp chẩn đoán nếu lỗi tiếp diễn. TestClient còn cảnh báo
+deprecation từ Starlette về HTTPX, không làm test thất bại.
 
 ## Migration và kiểm thử
 

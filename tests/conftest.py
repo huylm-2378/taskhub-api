@@ -15,6 +15,7 @@ os.environ["DATABASE_HOST"] = ""
 os.environ["CORS_ORIGINS"] = "http://localhost:3000,http://localhost:5173"
 os.environ["JWT_SECRET_KEY"] = "test-only-secret-key-never-use-in-production-0123456789"
 os.environ["ACCESS_TOKEN_EXPIRE_MINUTES"] = "30"
+os.environ["JWT_IAT_LEEWAY_SECONDS"] = "5"
 # Tests must not send mail or contact a real cache from the developer's .env.
 os.environ["EMAIL_ENABLED"] = "false"
 os.environ["REDIS_URL"] = ""

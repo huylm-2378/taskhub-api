@@ -8,7 +8,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
-from models import Comment, Project, Task, User, UserRole
+from models import Bookmark, Comment, Project, Tag, Task, User, UserRole, task_tags
+from schemas.task import TaskUpdate
 from security import create_access_token, hash_password
 from services import task_interactions
 
@@ -76,6 +77,25 @@ def test_assign_rejects_unauthorized_missing_and_inactive_targets(context):
     assert ctx.client.post(f"/api/tasks/{uuid4()}/assign", headers=ctx.headers["owner"], json=body).status_code == 404
     with SessionLocal() as db:
         assert db.get(Task, ctx.task_id).assignee_id == ctx.users["assignee"].id
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["tasks", "project-tasks"])
+def test_create_task_rejects_inactive_assignee_without_persisting(context, nested):
+    ctx = context
+    path = f"/api/projects/{ctx.project_id}/tasks" if nested else "/api/tasks"
+    body = {"title": "Must not be saved", "assignee_id": str(ctx.users["inactive"].id)}
+    if not nested:
+        body["project_id"] = str(ctx.project_id)
+    with SessionLocal() as db:
+        before = db.scalar(select(func.count()).select_from(Task))
+    response = ctx.client.post(path, headers=ctx.headers["owner"], json=body)
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "Assignee is inactive"
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(Task)) == before
+    # The failure must leave later requests usable.
+    body["assignee_id"] = str(ctx.users["assignee"].id)
+    assert ctx.client.post(path, headers=ctx.headers["owner"], json=body).status_code == 201
 
 
 def test_create_comment_uses_authenticated_author(context):
@@ -184,10 +204,14 @@ def invoke_operation(db, ctx, operation):
         return task_interactions.add_comment(db, ctx.task_id, "New", user)
     if operation == "edit":
         return task_interactions.edit_comment(db, ctx.task_id, ctx.comment_id, "Edited", user)
+    if operation == "update_task":
+        return task_interactions.update_task(db, ctx.task_id, TaskUpdate(status="IN_PROGRESS"), user)
+    if operation == "delete_task":
+        return task_interactions.delete_task(db, ctx.task_id, user)
     return task_interactions.delete_comment(db, ctx.task_id, ctx.comment_id, user)
 
 
-@pytest.mark.parametrize("operation", ["assign", "create", "edit", "delete"])
+@pytest.mark.parametrize("operation", ["assign", "create", "edit", "delete", "update_task", "delete_task"])
 @pytest.mark.parametrize("failure", ["integrity", "unexpected", "commit"])
 def test_transaction_rolls_back_flushed_writes_and_session_is_reusable(context, operation, failure):
     ctx = context
@@ -210,6 +234,7 @@ def test_transaction_rolls_back_flushed_writes_and_session_is_reusable(context, 
             event.remove(db, event_name, fail)
         assert not db.in_transaction()
         assert db.get(Task, ctx.task_id).assignee_id == ctx.users["assignee"].id
+        assert db.get(Task, ctx.task_id).status == "TODO"
         assert db.get(Comment, ctx.comment_id).content == "Original"
         assert db.scalar(select(func.count()).select_from(Comment)) == 1
         # The failed transaction was rolled back explicitly; this session works.
@@ -221,8 +246,109 @@ def test_transaction_rolls_back_flushed_writes_and_session_is_reusable(context, 
             assert db.scalar(select(func.count()).select_from(Comment)) == 2
         elif operation == "edit":
             assert db.get(Comment, ctx.comment_id).content == "Edited"
+        elif operation == "update_task":
+            assert db.get(Task, ctx.task_id).status == "IN_PROGRESS"
+        elif operation == "delete_task":
+            assert db.get(Task, ctx.task_id) is None
+            assert db.get(Comment, ctx.comment_id) is None
         else:
             assert db.get(Comment, ctx.comment_id) is None
+
+
+@pytest.mark.parametrize("actor", ["owner", "admin", "assignee"])
+def test_task_status_lifecycle_and_invalid_transitions(context, actor):
+    ctx = context
+    path = f"/api/tasks/{ctx.task_id}"
+    headers = ctx.headers[actor]
+    assert ctx.client.patch(path, headers=headers, json={"status": "DONE"}).status_code == 409
+    for status in ("TODO", "IN_PROGRESS", "IN_PROGRESS", "DONE", "DONE"):
+        response = ctx.client.patch(path, headers=headers, json={"status": status})
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == status
+        assert ctx.client.get(path, headers=headers).json()["status"] == status
+    for status in ("TODO", "IN_PROGRESS"):
+        assert ctx.client.patch(path, headers=headers, json={"status": status}).status_code == 409
+    listed = ctx.client.get("/api/tasks", headers=headers, params={"status": "DONE"}).json()
+    assert [task["id"] for task in listed] == [str(ctx.task_id)]
+
+
+def test_task_partial_update_and_assignment_permissions(context):
+    ctx = context
+    path = f"/api/tasks/{ctx.task_id}"
+    for actor in ("author", "outsider", "other_pm"):
+        assert ctx.client.patch(path, headers=ctx.headers[actor], json={"status": "IN_PROGRESS"}).status_code == 403
+    assert ctx.client.patch(path, headers=ctx.headers["assignee"], json={"title": "Forbidden", "status": "IN_PROGRESS"}).status_code == 403
+    response = ctx.client.patch(path, headers=ctx.headers["owner"], json={
+        "title": " Edited ", "description": "Details", "priority": 5,
+        "due_date": "2027-01-01T10:00:00+07:00",
+    })
+    assert response.status_code == 200, response.text
+    task = response.json()
+    assert task["title"] == "Edited" and task["status"] == "TODO"
+    assert task["priority"] == 5 and task["due_date"].startswith("2027-01-01T03:00:00")
+    stored = ctx.client.get(path, headers=ctx.headers["owner"]).json()
+    assert ctx.client.patch(path, headers=ctx.headers["owner"], json={}).json() == stored
+    response = ctx.client.patch(path, headers=ctx.headers["admin"], json={"description": None, "due_date": None})
+    assert response.json()["description"] is None and response.json()["due_date"] is None
+    # A failed transition cannot partially save other field changes.
+    assert ctx.client.patch(path, headers=ctx.headers["owner"], json={"title": "Do not save", "status": "DONE"}).status_code == 409
+    assert ctx.client.get(path, headers=ctx.headers["owner"]).json()["title"] == "Edited"
+    ctx.client.post(path + "/assign", headers=ctx.headers["owner"], json={"assignee_id": str(ctx.users["author"].id)})
+    assert ctx.client.patch(path, headers=ctx.headers["assignee"], json={"status": "IN_PROGRESS"}).status_code == 403
+    assert ctx.client.patch(path, headers=ctx.headers["author"], json={"status": "IN_PROGRESS"}).status_code == 200
+
+
+@pytest.mark.parametrize("body", [
+    {"title": None}, {"title": " "}, {"priority": None}, {"priority": 6},
+    {"status": None}, {"status": "invalid"}, {"due_date": "2027-01-01T00:00:00"},
+    {"project_id": str(uuid4())}, {"assignee_id": str(uuid4())}, {"tag_ids": []},
+])
+def test_task_update_rejects_invalid_fields(context, body):
+    ctx = context
+    response = ctx.client.patch(f"/api/tasks/{ctx.task_id}", headers=ctx.headers["owner"], json=body)
+    assert response.status_code == 422, response.text
+
+
+@pytest.mark.parametrize("actor", ["owner", "admin"])
+def test_delete_task_cascades_children_but_preserves_tags(context, actor):
+    ctx = context
+    with SessionLocal() as db:
+        task = db.get(Task, ctx.task_id)
+        tag = Tag(name="Keep this tag")
+        task.tags.append(tag)
+        db.add(Bookmark(user_id=ctx.users["author"].id, task_id=ctx.task_id))
+        db.commit()
+        tag_id = tag.id
+    path = f"/api/tasks/{ctx.task_id}"
+    for name in ("author", "assignee", "outsider", "other_pm"):
+        assert ctx.client.delete(path, headers=ctx.headers[name]).status_code == 403
+    response = ctx.client.delete(path, headers=ctx.headers[actor])
+    assert response.status_code == 204 and response.content == b""
+    assert ctx.client.delete(path, headers=ctx.headers[actor]).status_code == 404
+    assert ctx.client.get(path, headers=ctx.headers[actor]).status_code == 404
+    with SessionLocal() as db:
+        assert db.get(Task, ctx.task_id) is None
+        assert db.get(Comment, ctx.comment_id) is None
+        assert db.scalar(select(func.count()).select_from(Bookmark)) == 0
+        assert db.scalar(select(func.count()).select_from(task_tags)) == 0
+        assert db.get(Tag, tag_id) is not None
+        assert db.get(Project, ctx.project_id) is not None
+        assert db.get(Task, ctx.sibling_id) is not None
+
+
+def test_task_mutation_auth_missing_task_and_owner_transfer(context):
+    ctx = context
+    path = f"/api/tasks/{ctx.task_id}"
+    for method, body in (("patch", {"status": "IN_PROGRESS"}), ("delete", None)):
+        for headers, expected in (({}, 401), (ctx.headers["inactive"], 403)):
+            assert ctx.client.request(method, path, headers=headers, json=body).status_code == expected
+        assert ctx.client.request(method, f"/api/tasks/{uuid4()}", headers=ctx.headers["owner"], json=body).status_code == 404
+    ctx.client.patch(f"/api/projects/{ctx.project_id}", headers=ctx.headers["owner"],
+                     json={"owner_id": str(ctx.users["other_pm"].id)})
+    assert ctx.client.patch(path, headers=ctx.headers["owner"], json={"title": "Former owner"}).status_code == 403
+    assert ctx.client.delete(path, headers=ctx.headers["owner"]).status_code == 403
+    assert ctx.client.patch(path, headers=ctx.headers["other_pm"], json={"title": "New owner"}).status_code == 200
+    assert ctx.client.delete(path, headers=ctx.headers["other_pm"]).status_code == 204
 
 
 def test_database_conflict_is_409_and_does_not_persist_comment(context):

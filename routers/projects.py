@@ -64,8 +64,12 @@ def list_project_tasks(
 
 @router.post("/{project_id}/tasks", response_model=TaskWithRelations, status_code=201)
 def create_project_task(project_id: UUID, data: ProjectTaskCreate, db: DBSession, project: ManagedProject):
-    if data.assignee_id is not None and users.get(db, data.assignee_id) is None:
-        raise HTTPException(status_code=404, detail="Assignee not found")
+    if data.assignee_id is not None:
+        assignee = users.get(db, data.assignee_id)
+        if assignee is None:
+            raise HTTPException(status_code=404, detail="Assignee not found")
+        if not assignee.is_active:
+            raise HTTPException(status_code=409, detail="Assignee is inactive")
     task_tags = tags.get_many(db, data.tag_ids)
     if len(task_tags) != len(data.tag_ids):
         raise HTTPException(status_code=404, detail="Tag not found")
