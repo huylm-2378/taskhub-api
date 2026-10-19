@@ -82,7 +82,10 @@ services/               # Nghiệp vụ, transaction, email nền và cache tag
 models/                 # User, Project, Task, Comment, Tag, Bookmark
 alembic/versions/       # Lịch sử migration
 tests/                  # API, quan hệ và ràng buộc database
-compose.yaml            # PostgreSQL; Redis tùy chọn qua profile cache
+Dockerfile              # Image API Python 3.15, chạy với user không phải root
+docker-compose.yml      # App + migration + PostgreSQL; Redis tùy chọn
+middleware.py           # Request ID và access/error log
+logging_setup.py        # Log JSON ra stdout
 Makefile                # make dev: bật DB, migrate, chạy API
 ```
 
@@ -591,6 +594,145 @@ nối. Bộ test không cần Redis thật và không dùng SMTP/Redis từ `.en
 
 ```bash
 venv/bin/python3 -m pytest -q tests/test_background_tasks.py tests/test_tag_cache.py
+```
+
+## Bài 8: CORS, Logging và Docker triển khai
+
+### Frontend gọi API qua CORS
+
+Thiết lập các origin được phép trong `.env`, phân cách bằng dấu phẩy:
+
+```dotenv
+CORS_ORIGINS=http://localhost:3000,http://localhost:5173,https://app.example.com
+LOG_LEVEL=INFO
+```
+
+Origin gồm scheme, hostname và port, không có path hoặc dấu `/` cuối.
+`localhost` và `127.0.0.1` là hai origin khác nhau. Mặc định cho phép hai origin
+localhost ở trên; đặt `CORS_ORIGINS=` để không cho phép origin nào, không dùng `*`.
+Sau khi đổi cấu hình cần khởi động lại API (với Docker: tạo lại container bằng
+`docker compose up -d app`). CORS cho phép các phương thức API và hai header
+`Authorization`, `Content-Type`. Frontend dùng Bearer token:
+
+```javascript
+const response = await fetch("http://localhost:8000/api/projects", {
+  headers: { Authorization: `Bearer ${token}` },
+});
+console.log(response.headers.get("X-Request-ID"));
+const projects = await response.json();
+```
+
+Không cần `credentials: "include"` vì API không dùng cookie để xác thực.
+CORS không thay thế JWT hoặc phân quyền. Preflight hợp lệ không cần đăng nhập;
+request dữ liệu vẫn phải có token. `CORSMiddleware` bọc toàn bộ FastAPI để cả
+response lỗi 500 cũng có CORS header cho origin được phép, theo hướng dẫn
+[Starlette về CORS toàn cục](https://www.starlette.io/middleware/#corsmiddleware-global-enforcement).
+`main:app` vẫn là entrypoint Uvicorn; đối tượng FastAPI bên trong là `main.api`
+khi cần đăng ký route hoặc thay dependency trong test.
+
+### Theo dõi lỗi và request
+
+Log API xuất mỗi dòng một JSON ra stdout, có thời gian UTC, mức log, tên logger
+và message. Access log thêm method, mẫu route (ví dụ `/api/tasks/{task_id}`),
+status, thời gian xử lý `duration_ms` và `request_id`. Thời gian này bao gồm cả
+background task chạy trong tiến trình. API tạo ID riêng cho từng request và
+trả qua `X-Request-ID`; frontend được phép đọc header này qua CORS.
+
+Lỗi chưa được xử lý ghi ở mức ERROR, kèm loại exception và vị trí các frame
+trong traceback (file, dòng, hàm). Response 500 giữ thông báo chung. Formatter
+không ghi exception message hoặc biến local vì chúng có thể chứa tham số SQL
+hay mật khẩu. Access log không ghi body, query string, header Authorization
+hoặc giá trị tham số URL. Khi viết log mới, cũng không đưa dữ liệu nhạy cảm vào
+message. Access log mặc định của Uvicorn được tắt để tránh ghi raw URL trùng lặp.
+
+```bash
+docker compose logs -f --tail=100 app
+docker compose logs --tail=100 migrate db
+```
+
+`LOG_LEVEL` nhận `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Chọn INFO để xem
+request thông thường. Docker giới hạn log của app/migrate ở 10 MB mỗi file,
+giữ tối đa 3 file. Log migration dùng cấu hình Alembic hiện có trên stderr.
+
+### Chạy App + PostgreSQL bằng Docker
+
+Yêu cầu Docker Engine và Docker Compose v2 trở lên. Không cần Python/venv trên
+máy host để chạy stack. Nếu setup mới, sao chép `.env.example` thành `.env`;
+giữ `.env` hiện có nếu đã cấu hình. Đặt `POSTGRES_PASSWORD` riêng và tạo
+`JWT_SECRET_KEY` ngẫu nhiên tối thiểu 32 byte. Có thể tạo khóa bằng Docker:
+
+```bash
+docker run --rm python:3.15.0-slim-bookworm python -c 'import secrets; print(secrets.token_hex(32))'
+```
+
+Chép kết quả vào `.env`, cấu hình `CORS_ORIGINS` đúng địa chỉ frontend, rồi chạy:
+
+```bash
+docker compose config --quiet
+docker compose up -d --build --wait
+docker compose ps -a
+curl http://127.0.0.1:8000/health
+```
+
+Swagger: <http://127.0.0.1:8000/docs>. Nếu đang chạy `make dev`, dừng API local
+trước hoặc đặt `APP_PORT=8001` trong `.env` để tránh trùng cổng.
+
+Trình tự khởi động: PostgreSQL báo healthy → service `migrate` chạy
+`alembic upgrade head` thành công → service `app` khởi động Uvicorn. Job migrate
+thoát với mã 0 là bình thường; nếu migration thất bại, app mới không khởi động.
+Compose dùng [điều kiện depends_on](https://docs.docker.com/compose/how-tos/startup-order/)
+để kiểm soát thứ tự này. `/health` là liveness của tiến trình API, không phải
+kiểm tra kết nối database hay Redis.
+
+App trong container nối tới `db:5432`, lấy user/password/database từ các biến
+`POSTGRES_*`. Compose đặt `DATABASE_HOST=db`; khi biến này có giá trị, cấu hình
+ghép URL bằng SQLAlchemy và bỏ qua `DATABASE_URL` local. Vì vậy không phải đổi
+`localhost` trong `.env` khi chuyển giữa Docker và `make dev`. Mật khẩu có ký tự
+đặc biệt cũng được mã hóa đúng trong URL. `POSTGRES_PORT` chỉ là cổng trên host.
+Không đặt `DATABASE_HOST` trong `.env` khi chạy local với `make dev`.
+
+Image dùng Python 3.15.0, chỉ cài dependencies runtime, chạy bằng user `taskhub`
+(UID 10001), không dùng `--reload` và không bind-mount mã nguồn.
+`.dockerignore` loại `.env`, Git, venv, cache và database cục bộ khỏi build context.
+Secrets chỉ được truyền lúc chạy qua `.env`, không được đóng vào image.
+PostgreSQL lưu dữ liệu ở volume `taskhub_postgres_data` như cấu hình cũ.
+
+Mặc định app chỉ publish ở `127.0.0.1:8000`. Khi triển khai trên server, có thể
+đặt reverse proxy HTTPS phía trước hoặc đặt `APP_BIND_HOST=0.0.0.0` để truy cập
+trực tiếp qua cổng `APP_PORT`. PostgreSQL vẫn chỉ publish trên localhost.
+Cấu hình này cung cấp stack chạy trên một máy; backup database, HTTPS/domain
+và giám sát của môi trường thật cần được thiết lập trên server triển khai.
+
+Redis vẫn tùy chọn. Để bật cho app trong Docker, đặt
+`DOCKER_REDIS_URL=redis://redis:6379/0` trong `.env`, rồi chạy:
+
+```bash
+docker compose --profile cache up -d --build --wait
+```
+
+`REDIS_URL` dùng cho API chạy local; Docker dùng `DOCKER_REDIS_URL` để tránh nối
+nhầm tới localhost của container. Khi Redis chưa sẵn sàng, API quay về đọc DB.
+
+Khi cập nhật phiên bản có migration, thực hiện trong thời gian bảo trì:
+
+```bash
+docker compose build
+docker compose stop app
+docker compose run --rm migrate
+# Chỉ chạy tiếp nếu migration thành công:
+docker compose up -d --wait
+```
+
+Dừng stack bằng `docker compose down`; volume database được giữ lại.
+Không thêm `-v` nếu muốn giữ dữ liệu. Luồng `make dev` vẫn chỉ bật service `db`,
+chạy migration và API local như trước.
+
+Test CORS kiểm tra preflight, origin bị từ chối và JWT vẫn bắt buộc. Test log
+kiểm tra request ID, lỗi 500 có CORS, thông tin trace và loại bỏ dữ liệu nhạy cảm:
+
+```bash
+venv/bin/python3 -m pytest -q tests/test_deployment.py
+venv/bin/python3 -m pytest -q
 ```
 
 ## Migration và kiểm thử

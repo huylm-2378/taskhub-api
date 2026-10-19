@@ -2,10 +2,21 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from sqlalchemy import URL
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+# Containers use separate fields so passwords containing @, / or % work too.
+if os.getenv("DATABASE_HOST"):
+    DATABASE_URL = URL.create(
+        "postgresql+psycopg",
+        username=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"],
+        host=os.environ["DATABASE_HOST"],
+        port=int(os.getenv("DATABASE_PORT", "5432")),
+        database=os.environ["POSTGRES_DB"],
+    ).render_as_string(hide_password=False)
 if not DATABASE_URL:
     raise RuntimeError("Set DATABASE_URL in .env (see .env.example).")
 
@@ -19,6 +30,16 @@ JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 if ACCESS_TOKEN_EXPIRE_MINUTES < 1:
     raise ValueError("ACCESS_TOKEN_EXPIRE_MINUTES must be positive.")
+
+CORS_ORIGINS = [origin.strip() for origin in os.getenv(
+    "CORS_ORIGINS", "http://localhost:3000,http://localhost:5173"
+).split(",") if origin.strip()]
+if "*" in CORS_ORIGINS:
+    raise ValueError("CORS_ORIGINS must list explicit frontend origins, not *.")
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+if LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+    raise ValueError("Invalid LOG_LEVEL.")
 
 
 def env_bool(name: str, default: str = "false") -> bool:

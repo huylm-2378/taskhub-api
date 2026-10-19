@@ -121,7 +121,7 @@ def test_inflight_read_cannot_refill_current_generation(cached_client, monkeypat
 
 
 def test_cache_does_not_bypass_authentication(cached_client):
-    from main import app
+    from main import api as app
     from routers.dependencies import get_current_user
 
     client, _, _, read = cached_client
