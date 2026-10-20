@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from sqlalchemy import URL
@@ -76,3 +77,10 @@ TAGS_CACHE_TTL_SECONDS = int(os.getenv("TAGS_CACHE_TTL_SECONDS", "60"))
 TAGS_CACHE_PREFIX = os.getenv("TAGS_CACHE_PREFIX", "taskhub:tags:v1")
 if TAGS_CACHE_TTL_SECONDS < 1 or not TAGS_CACHE_PREFIX:
     raise ValueError("Tag cache requires a positive TTL and a nonempty prefix.")
+
+# Separate Redis databases keep queue/results independent of the optional cache.
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/1")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/2")
+CELERY_TIMEZONE = os.getenv("CELERY_TIMEZONE", "Asia/Ho_Chi_Minh")
+
+ZoneInfo(CELERY_TIMEZONE)  # Fail at startup for an invalid schedule timezone.

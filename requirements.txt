@@ -10,3 +10,5 @@ bcrypt>=5,<6
 PyJWT>=2.10,<3
 python-multipart>=0.0.20,<1
 redis>=5,<8
+celery[redis]>=5.6,<5.7
+openpyxl>=3.1.5,<4

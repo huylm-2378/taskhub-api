@@ -11,6 +11,8 @@ x-app: &app-base
     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
     REDIS_URL: ${DOCKER_REDIS_URL:-}
+    CELERY_BROKER_URL: ${DOCKER_CELERY_BROKER_URL:-redis://redis:6379/1}
+    CELERY_RESULT_BACKEND: ${DOCKER_CELERY_RESULT_BACKEND:-redis://redis:6379/2}
   logging:
     driver: json-file
     options:
@@ -41,6 +43,43 @@ services:
     depends_on:
       db:
         condition: service_healthy
+  worker:
+    <<: *app-base
+    profiles: ["jobs"]
+    restart: unless-stopped
+    command: ["python", "-m", "celery", "-A", "celery_app:celery_app", "worker", "--loglevel=INFO", "--queues=heavy", "--concurrency=2", "--hostname=heavy@%h"]
+    stop_grace_period: 60s
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+  worker-maintenance:
+    <<: *app-base
+    profiles: ["jobs"]
+    restart: unless-stopped
+    command: ["python", "-m", "celery", "-A", "celery_app:celery_app", "worker", "--loglevel=INFO", "--queues=maintenance", "--concurrency=1", "--hostname=maintenance@%h"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+  beat:
+    <<: *app-base
+    profiles: ["jobs"]
+    restart: unless-stopped
+    command: ["python", "-m", "celery", "-A", "celery_app:celery_app", "beat", "--loglevel=INFO", "--schedule=/var/lib/taskhub/beat/schedule"]
+    volumes:
+      - celery_beat:/var/lib/taskhub/beat
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
   db:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -65,10 +104,13 @@ services:
       - "127.0.0.1:${MAILPIT_SMTP_PORT:-1025}:1025"
   redis:
     image: redis:7-alpine
-    profiles: ["cache"]
+    profiles: ["cache", "jobs"]
+    restart: unless-stopped
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -76,3 +118,5 @@ services:
       retries: 10
 volumes:
   postgres_data:
+  redis_data:
+  celery_beat:
