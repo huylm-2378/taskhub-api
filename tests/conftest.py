@@ -19,6 +19,9 @@ os.environ["JWT_IAT_LEEWAY_SECONDS"] = "5"
 # Tests must not send mail or contact a real cache from the developer's .env.
 os.environ["EMAIL_ENABLED"] = "false"
 os.environ["REDIS_URL"] = ""
+os.environ["CELERY_BROKER_URL"] = "memory://"
+os.environ["CELERY_RESULT_BACKEND"] = "cache+memory://"
+os.environ["CELERY_TIMEZONE"] = "Asia/Ho_Chi_Minh"
 
 from database import Base, engine  # noqa: E402
 from main import api, app  # noqa: E402

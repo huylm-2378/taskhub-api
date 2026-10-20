@@ -8,7 +8,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt \
     && groupadd --gid 10001 taskhub \
-    && useradd --uid 10001 --gid taskhub --no-create-home taskhub
+    && useradd --uid 10001 --gid taskhub --no-create-home taskhub \
+    && mkdir -p /var/lib/taskhub/beat \
+    && chown taskhub:taskhub /var/lib/taskhub/beat
 
 COPY . .
 USER taskhub

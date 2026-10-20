@@ -84,6 +84,8 @@ alembic/versions/       # Lịch sử migration
 tests/                  # API, quan hệ và ràng buộc database
 Dockerfile              # Image API Python 3.15, chạy với user không phải root
 docker-compose.yml      # App + migration + PostgreSQL; Redis tùy chọn
+celery_app.py            # Broker/backend Redis, routing và lịch Celery Beat
+workers/tasks.py         # Export Excel, email nhắc việc, quét job chờ
 middleware.py           # Request ID và access/error log
 logging_setup.py        # Log JSON ra stdout
 Makefile                # make dev: bật DB, migrate, chạy API
@@ -866,6 +868,159 @@ này vẫn trả 200. TLS/domain và backup trên server thật chưa được k
 chưa có đủ log để kết luận đây chắc chắn là nguyên nhân của các lượt lỗi cũ.
 Log độ lệch mới giúp chẩn đoán nếu lỗi tiếp diễn. TestClient còn cảnh báo
 deprecation từ Starlette về HTTPX, không làm test thất bại.
+
+## 9. Advance
+
+### 9.1 Heavy Background Jobs & Cron Jobs
+
+`BackgroundTasks` chạy trong tiến trình API: không có queue bền vững, retry hay
+lịch chạy định kỳ. Luồng mới dùng **Celery + Redis + Celery Beat** để export Excel
+và gửi email nhắc việc. Worker chạy độc lập, không giữ session của HTTP request.
+Email thông báo comment ở phần học trước vẫn dùng `BackgroundTasks`, nên vẫn có
+giới hạn mất thông báo khi API sập; cơ chế bền vững dưới đây áp dụng cho job mới.
+
+#### Chạy bằng Docker
+
+```bash
+docker compose --profile jobs up -d --build
+docker compose --profile jobs logs -f worker worker-maintenance beat
+```
+
+Profile `jobs` bật Redis, worker queue `heavy` (export), worker queue
+`maintenance` (email và điều phối) và Beat. App/migration dùng chung image với
+worker; migration `0005` tạo bảng `jobs`. Queue ngắn có worker riêng để export
+không chặn lịch và email. Chỉ chạy **một Beat** cho mỗi lịch. Có thể tăng số worker,
+nhưng không tăng số Beat. `/health` vẫn chỉ là liveness của API.
+
+Redis bật AOF `everysec`, volume riêng và `noeviction`; không dùng Redis này làm
+cache có eviction hoặc chạy `FLUSHALL`. Broker dùng DB 1, result backend DB 2,
+cache tùy chọn dùng DB 0. Các Redis DB logic vẫn chia sẻ RAM và tiến trình.
+Khi triển khai lớn, tách Redis cache khỏi Redis queue.
+
+Local: cài lại `requirements-dev.txt`, chạy migration, bật Redis rồi chạy ba
+terminal dưới đây cùng với `make dev`:
+
+```bash
+docker compose --profile jobs up -d --wait redis
+venv/bin/python -m celery -A celery_app:celery_app worker -Q heavy --concurrency=2 -l INFO
+venv/bin/python -m celery -A celery_app:celery_app worker -Q maintenance --concurrency=1 -l INFO
+venv/bin/python -m celery -A celery_app:celery_app beat -l INFO --schedule=/tmp/taskhub-celerybeat-schedule
+```
+
+Local dùng `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND`; container dùng
+`DOCKER_CELERY_BROKER_URL`/`DOCKER_CELERY_RESULT_BACKEND` (mặc định hostname
+`redis`). Không chạy đồng thời Beat local và Beat Docker với cùng broker.
+Khi nâng cấp schema, dừng cả API, hai worker và Beat trước migration rồi khởi
+động lại cùng phiên bản. Volume DB, Redis và lịch Beat được giữ khi `down`;
+không dùng `down -v` nếu cần giữ dữ liệu.
+
+#### Export Excel qua queue
+
+Đăng nhập rồi gửi JWT của **chủ project hoặc admin**:
+
+```http
+POST /api/jobs/exports
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "project_id": "<project UUID>",
+  "idempotency_key": "project-report-2026-10-20-v1"
+}
+```
+
+API trả **202** với `id`, `status`, `attempts`, `updated_at`, `error_code`.
+Gửi lại cùng key và payload trả cùng job; đổi payload nhưng giữ key trả **409**.
+Key có scope theo người tạo và loại job, tối đa 128 ký tự
+`A-Z a-z 0-9 _ . : -`. Muốn tạo báo cáo mới, dùng key mới.
+
+| Endpoint | Ý nghĩa |
+| --- | --- |
+| `POST /api/jobs/exports` | Lưu job rồi đưa `job_id` vào queue |
+| `GET /api/jobs/{job_id}` | Xem trạng thái job của mình |
+| `GET /api/jobs/{job_id}/download` | Tải `.xlsx` khi `succeeded`; chưa sẵn sàng trả 409 |
+
+Người khác nhận 404 khi truy cập job. Quyền quản lý project được kiểm tra lại
+khi worker bắt đầu và khi tải, nên chuyển chủ project không để lại quyền tải cũ.
+Báo cáo chứa tối đa 100.000 task của project, gồm ID, title, status, priority,
+due date, assignee ID. Vượt giới hạn trả job `failed`, không trả file bị cắt.
+Nội dung người dùng được ghi dưới dạng text, tránh Excel diễn giải thành formula.
+Dữ liệu được đọc khi worker chạy, không phải snapshot tại thời điểm POST.
+
+#### Idempotency, retry và phục hồi
+
+1. API commit bản ghi `jobs` trước khi publish. Unique constraint
+   `(owner_id, kind, idempotency_key)` phân xử cả các request đồng thời.
+2. Worker nhận duy nhất `job_id`, mở session riêng, khóa row bằng PostgreSQL
+   `FOR UPDATE SKIP LOCKED` và kiểm tra trạng thái. Job đã hoàn tất không chạy lại.
+3. Export ghi file và trạng thái thành công **trong cùng transaction**. Worker
+   sập trước commit thì transaction rollback; sập sau commit thì lần nhận lại
+   chỉ trả trạng thái cũ. File nằm trong DB để API và worker không phụ thuộc
+   filesystem chung.
+4. Lỗi export có thể retry tối đa 5 lần thực thi, backoff 60/120/240/480 giây.
+   Lỗi quyền hoặc giới hạn dữ liệu kết thúc ngay. Lỗi kết nối DB được Celery
+   retry riêng; nếu DB không thể ghi trạng thái, bộ quét vẫn có thể thử lại sau
+   khi DB phục hồi.
+5. Beat quét tối đa 100 job chờ mỗi 30 giây. Publish lỗi giữ nguyên job; publish
+   thành công nhưng không có kết quả sau 5 phút thì có thể publish lại.
+   Lock và trạng thái DB chống tác dụng trùng; Celery `task_id` một mình không
+   loại trùng. Nếu cả Beat dừng thì job còn trong DB, chờ Beat khởi động lại.
+
+Celery bật `acks_late`, `task_reject_on_worker_lost`, prefetch 1 và JSON serializer.
+Giới hạn task cứng 30 phút, visibility timeout Redis 60 phút. Redis result
+backend giữ kết quả nhỏ trong 24 giờ; API dùng trạng thái trong DB làm nguồn
+chính. AOF `everysec` vẫn có cửa sổ mất dữ liệu gần nhất khi máy sập; bản ghi job
+trong PostgreSQL cho phép phục hồi publication của các job còn chờ.
+
+#### Nhắc việc hằng ngày lúc 08:00
+
+Beat dùng `crontab(hour=8, minute=0)` với `CELERY_TIMEZONE=Asia/Ho_Chi_Minh`.
+Bật `EMAIL_ENABLED=true` và cấu hình SMTP như phần email. Mỗi user đang hoạt động
+có task chưa DONE, đã quá hạn hoặc đến hạn trong ngày sẽ có một job với key
+`daily:YYYY-MM-DD`. Chạy scheduler lặp trong cùng ngày không tạo job trùng.
+Worker kiểm tra lại user/task, gửi một email tổng hợp tối đa 100 task; không còn
+việc phù hợp hoặc email bị tắt thì chuyển `skipped`.
+
+**SMTP không cung cấp exactly-once:** DB không thể commit nguyên tử cùng máy chủ
+email. Worker commit trạng thái `sending` trước SMTP. Khi timeout hoặc lỗi gửi,
+job chuyển `uncertain`; nếu worker chết, bộ quét chuyển `sending` quá 10 phút
+sang `uncertain`. Các trạng thái này **không tự gửi lại**. Cách này tránh gửi hai
+lần do retry nhưng có thể bỏ lỡ email nếu crash xảy ra trước khi SMTP nhận.
+Kiểm tra log/provider trước khi quyết định gửi bù. Muốn vừa retry tự động vừa
+chống trùng ở nhà cung cấp, cần dịch vụ email có hỗ trợ idempotency key; SMTP
+`Message-ID` không đảm bảo điều đó.
+
+Beat là scheduler, không phải lịch sử chạy bù: bản triển khai này không đảm bảo
+nhắc lại từng ngày đã bỏ lỡ nếu toàn bộ scheduler/broker ngừng nhiều ngày.
+Chưa thêm nén video vì TaskHub chưa có luồng upload/media; khi thêm, đưa vào
+queue `heavy`, dùng `job_id` và object storage, publish artifact nguyên tử.
+File Excel hiện lưu trong DB và chưa có retention tự động; cần chính sách dọn
+artifact và giữ key đủ lâu trước khi dùng cho dữ liệu lớn.
+
+Kiểm thử:
+
+```bash
+venv/bin/python -m pytest -q tests/test_jobs.py
+venv/bin/python -m pytest -q
+```
+
+Test cover replay, unique constraint, quyền, formula injection, publish outage,
+outbox recovery, retry, rollback khi worker crash, lịch theo timezone và SMTP
+không gửi lại khi kết quả không xác định. SQLite không có row lock như
+PostgreSQL; kiểm thử chạy đồng thời thực tế cần PostgreSQL và worker riêng.
+
+Kiểm chứng ngày 20/10/2026: **184 test đạt, 1 test SMTP tùy chọn bỏ qua**.
+Đã kiểm tra riêng trên stack Docker tạm với PostgreSQL, Redis, worker prefork,
+Beat và Mailpit: 16 lần tạo job đồng thời cùng key chỉ sinh một row, hai lần
+thực thi đồng thời chỉ export một lần, API → queue → tải Excel thành công,
+gọi lịch nhắc việc hai lần vẫn chỉ có một email SMTP. `alembic check` khớp schema
+PostgreSQL. Stack này dùng dữ liệu/volume riêng, không dùng DB phát triển.
+
+Tham khảo chính thức:
+[Celery Tasks](https://docs.celeryq.dev/en/stable/userguide/tasks.html),
+[Periodic Tasks](https://docs.celeryq.dev/en/stable/userguide/periodic-tasks.html),
+[Celery với Redis](https://docs.celeryq.dev/en/stable/getting-started/backends-and-brokers/redis.html),
+[Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
 
 ## Migration và kiểm thử
 
