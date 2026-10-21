@@ -1,5 +1,6 @@
 from pydantic import Field, field_validator
 
+import error_messages as errors
 from schemas.base import InputSchema, ReadSchema
 
 
@@ -14,7 +15,7 @@ class TagUpdate(InputSchema):
     @classmethod
     def reject_null_name(cls, value: str | None) -> str:
         if value is None:
-            raise ValueError("name cannot be null")
+            raise ValueError(errors.TAG_NAME_CANNOT_BE_NULL)
         return value
 
 

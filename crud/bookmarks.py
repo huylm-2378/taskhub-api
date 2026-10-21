@@ -1,6 +1,7 @@
 from uuid import UUID
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import delete as sql_delete
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from crud.common import save
@@ -19,3 +20,17 @@ def create(db: Session, user_id: UUID, task_id: UUID) -> Bookmark:
         if existing is None:
             raise
         return existing
+
+
+def delete(db: Session, user_id: UUID, task_id: UUID) -> None:
+    statement = sql_delete(Bookmark).where(
+        Bookmark.user_id == user_id,
+        Bookmark.task_id == task_id,
+    )
+
+    try:
+        db.execute(statement)
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise

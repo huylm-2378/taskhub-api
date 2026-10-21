@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -36,30 +37,45 @@ def create_context(client):
 
 def test_create_project_task_with_relations_and_profile(client):
     user, project, tags = create_context(client)
+    due_date = (datetime.now(UTC) + timedelta(days=1)).astimezone(timezone(timedelta(hours=7)))
     path = f"/api/projects/{project['id']}/tasks"
-    assert client.get(path).json() == []
+    assert client.get(path).json() == {"items": [], "total": 0, "offset": 0, "limit": 20}
     response = client.post(path, json={
         "title": "Build API", "assignee_id": user["id"],
         "tag_ids": [tags[0]["id"], tags[1]["id"], tags[0]["id"]],
-        "due_date": "2026-10-21T15:00:00+07:00",
+        "due_date": due_date.isoformat(),
     })
     assert response.status_code == 201, response.text
     task = response.json()
+    assert task["status"] == "TODO"
     assert task["project_id"] == project["id"]
-    assert task["assignee"] == user
+    assert task["assignee"] == {
+        key: user[key] for key in ("id", "created_at", "name", "username")
+    }
     assert task["tags"] == tags
-    assert task["due_date"].startswith("2026-10-21T08:00:00")
+    actual_due_date = datetime.fromisoformat(task["due_date"].replace("Z", "+00:00"))
+    # SQLite drops timezone metadata from the UTC value stored by the schema.
+    if actual_due_date.tzinfo is None:
+        actual_due_date = actual_due_date.replace(tzinfo=UTC)
+    assert actual_due_date == due_date.astimezone(UTC)
     listed = client.get(path)
     assert listed.status_code == 200, listed.text
-    assert len(listed.json()) == 1
-    assert listed.json()[0]["tags"] == tags
-    assert client.get(path, params={"status": "DONE"}).json() == []
+    assert len(listed.json()["items"]) == listed.json()["total"] == 1
+    assert listed.json()["items"][0]["tags"] == tags
+    assert client.get(path, params={"status": "DONE"}).json() == {"items": [], "total": 0, "offset": 0, "limit": 20}
     profile = client.get("/api/users/HUY_TEST/profile")
     assert profile.status_code == 200, profile.text
     data = profile.json()
-    assert data["username"] == "huy_test"
-    assert data["projects"] == [{**project, "tasks": listed.json()}]
-    assert data["assigned_tasks"] == listed.json()
+    assert data == {key: user[key] for key in ("id", "created_at", "name", "username")}
+    assert client.get("/api/projects", params={"owner_id": user["id"]}).json() == {
+        "items": [project], "total": 1, "offset": 0, "limit": 20,
+    }
+    response = client.get("/api/tasks", params={"assignee_id": user["id"]})
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [{key: value for key, value in task.items() if key not in {"assignee", "tags"}}],
+        "total": 1, "offset": 0, "limit": 20,
+    }
 
 
 def test_project_task_pagination_and_scope(client):
@@ -71,14 +87,14 @@ def test_project_task_pagination_and_scope(client):
         assert response.json()["assignee"] is None
     other = client.post("/api/projects", json={"name": "Other", "owner_id": user["id"]}).json()
     client.post(f"/api/projects/{other['id']}/tasks", json={"title": "Other task"})
-    all_tasks = client.get(path).json()
+    all_tasks = client.get(path).json()["items"]
     assert len(all_tasks) == 3
     assert len({task["id"] for task in all_tasks}) == 3
     for offset in range(3):
         page = client.get(path, params={"offset": offset, "limit": 1}).json()
-        assert page == all_tasks[offset:offset + 1]
-        assert len(page[0]["tags"]) == 2
-    assert client.get(path, params={"offset": 3}).json() == []
+        assert page == {"items": all_tasks[offset:offset + 1], "total": 3, "offset": offset, "limit": 1}
+        assert len(page["items"][0]["tags"]) == 2
+    assert client.get(path, params={"offset": 3}).json() == {"items": [], "total": 3, "offset": 3, "limit": 20}
     for query in [{"limit": 0}, {"offset": -1}, {"limit": 101}, {"status": "invalid"}]:
         assert client.get(path, params=query).status_code == 422
 
@@ -99,7 +115,7 @@ def test_invalid_nested_task_requests_are_atomic(client):
     ]:
         response = client.post(path, json={"title": "Invalid", **data})
         assert response.status_code == code, response.text
-    assert client.get(path).json() == []
+    assert client.get(path).json() == {"items": [], "total": 0, "offset": 0, "limit": 20}
     for project_id, code in [(str(uuid4()), 404), ("invalid", 422)]:
         missing_path = f"/api/projects/{project_id}/tasks"
         assert client.get(missing_path).status_code == code
@@ -118,7 +134,13 @@ def test_usernames_and_empty_profile(client):
     generated_user = generated.json()
     assert generated_user["username"].startswith("user_")
     profile = client.get(f"/api/users/{generated_user['username']}/profile")
-    assert profile.json() == {**generated_user, "projects": [], "assigned_tasks": []}
+    assert profile.json() == {
+        key: generated_user[key] for key in ("id", "created_at", "name", "username")
+    }
+    for path, filter_name in (("/api/projects", "owner_id"), ("/api/tasks", "assignee_id")):
+        response = client.get(path, params={filter_name: generated_user["id"]})
+        assert response.status_code == 200
+        assert response.json() == {"items": [], "total": 0, "offset": 0, "limit": 20}
     assert client.get("/api/users/missing/profile").status_code == 404
     assert client.get("/api/users/a!/profile").status_code == 422
     for username in [None, "ab", "bad name", "x" * 65]:
@@ -144,22 +166,32 @@ def test_nested_responses_have_bounded_queries(client, size):
             db.add(Task(title=f"Assigned {index}", project=external_project, assignee=owner, tags=[tag]))
         db.commit()
         project_id = project.id
+        owner_id = str(owner.id)
 
     with count_selects() as statements:
         response = client.get(f"/api/projects/{project_id}/tasks", params={"limit": 100})
         assert response.status_code == 200, response.text
-        assert len(response.json()) == size
-        assert all(task["assignee"] and task["tags"] for task in response.json())
-    assert len(statements) == 2
+        assert len(response.json()["items"]) == response.json()["total"] == size
+        assert all(task["assignee"] and task["tags"] for task in response.json()["items"])
+    assert len(statements) == 3
 
     with count_selects() as statements:
         response = client.get("/api/users/owner/profile")
         assert response.status_code == 200, response.text
         profile = response.json()
-        assert len(profile["projects"]) == size + 1
-        assert len(profile["assigned_tasks"]) == size
-        assert sum(len(project["tasks"]) for project in profile["projects"]) == size * 2
-    assert len(statements) == 4
+        assert profile["id"] == owner_id
+        assert set(profile) == {"id", "created_at", "name", "username"}
+    assert len(statements) == 1
+
+    for path, filter_name, expected_count in (
+        ("/api/projects", "owner_id", size + 1), ("/api/tasks", "assignee_id", size),
+    ):
+        with count_selects() as statements:
+            response = client.get(path, params={filter_name: owner_id, "limit": 100})
+            assert response.status_code == 200, response.text
+            assert len(response.json()["items"]) == response.json()["total"] == expected_count
+        assert len(statements) == 2
+        assert "LIMIT" in statements[-1].upper()
 
 
 def test_relationship_openapi(client):
@@ -167,5 +199,23 @@ def test_relationship_openapi(client):
     tasks_path = schema["paths"]["/api/projects/{project_id}/tasks"]
     assert "get" in tasks_path and "post" in tasks_path
     assert "/api/users/{username}/profile" in schema["paths"]
+    for path in ("/api/users/{user_id}", "/api/users/{username}/profile"):
+        response_schema = schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        assert response_schema["$ref"] == "#/components/schemas/UserSummary"
+    for collection in ("projects", "assigned-tasks"):
+        assert f"/api/users/{{user_id}}/{collection}" not in schema["paths"]
+    for path, page_name, response_model in (
+        ("/api/projects", "offset", "ProjectRead"), ("/api/tasks", "skip", "TaskRead"),
+        ("/api/projects/{project_id}/tasks", "skip", "TaskWithRelations"),
+    ):
+        operation = schema["paths"][path]["get"]
+        params = {item["name"]: item["schema"] for item in operation["parameters"]}
+        assert params[page_name]["default"] == 0 and params[page_name]["minimum"] == 0
+        assert params["limit"]["default"] == 20 and params["limit"]["maximum"] == 100
+        assert operation["security"]
+        response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+        page_schema = schema["components"]["schemas"][response_schema["$ref"].split("/")[-1]]
+        assert set(page_schema["required"]) == {"items", "total", "offset", "limit"}
+        assert page_schema["properties"]["items"]["items"]["$ref"] == f"#/components/schemas/{response_model}"
     fields = schema["components"]["schemas"]["ProjectTaskCreate"]["properties"]
     assert "tag_ids" in fields and "project_id" not in fields

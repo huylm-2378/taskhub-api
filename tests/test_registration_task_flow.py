@@ -39,7 +39,8 @@ def test_register_login_create_project_and_task(anonymous_client, nested):
     assert fetched.status_code == 200
     assert fetched.json()["title"] == "First task"
     listed = client.get("/api/tasks?status=TODO&priority=HIGH", headers=headers)
-    assert [entry["id"] for entry in listed.json()] == [task["id"]]
+    assert [entry["id"] for entry in listed.json()["items"]] == [task["id"]]
+    assert listed.json()["total"] == 1
     with SessionLocal() as db:
         stored_user = db.get(User, UUID(user["id"]))
         assert stored_user.hashed_password != credentials["password"]

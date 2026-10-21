@@ -74,6 +74,7 @@ Với PostgreSQL có sẵn ngoài Docker Compose, cấu hình `DATABASE_URL` r�
 ```text
 main.py                 # Khởi tạo app, đăng ký router
 config.py               # Đọc .env và cấu hình pool
+error_messages.py       # Thông báo lỗi dùng chung
 database.py             # Engine, Base, SessionLocal, get_db
 routers/                # HTTP, validation tham số, mã lỗi
 schemas/                # Pydantic: dữ liệu đầu vào và response
@@ -90,6 +91,26 @@ middleware.py           # Request ID và access/error log
 logging_setup.py        # Log JSON ra stdout
 Makefile                # make dev: bật DB, migrate, chạy API
 ```
+
+## Thông báo lỗi dùng chung
+
+Các thông báo lỗi do ứng dụng định nghĩa nằm trong `error_messages.py`, dùng
+chung cho router, schema, service, cấu hình và worker. Khi cần thêm lỗi mới,
+khai báo hằng số ở file này rồi sử dụng tại nơi phát sinh lỗi:
+
+```python
+import error_messages as errors
+
+raise HTTPException(status_code=404, detail=errors.USER_NOT_FOUND)
+```
+
+Mã HTTP và loại exception vẫn được quyết định tại chỗ gọi. Với thông báo có
+tham số, dùng placeholder có tên, ví dụ
+`errors.INVALID_BOOLEAN_ENV.format(name=name)`. Module này không import các
+module ứng dụng khác để tránh phụ thuộc vòng khi khởi động.
+
+Việc gom thông báo không thay đổi nội dung lỗi hay định dạng response. Lỗi
+validation tự sinh bởi FastAPI/Pydantic vẫn do framework xử lý.
 
 ## Model và quan hệ
 
@@ -116,25 +137,53 @@ nối tính riêng cho mỗi worker: `DB_POOL_SIZE + DB_MAX_OVERFLOW`. Dependenc
 | POST | `/api/users/login` | Đăng nhập bằng form OAuth2, trả JWT |
 | GET / PUT | `/api/users/me` | Xem / cập nhật tài khoản đang đăng nhập |
 | POST / GET | `/api/users` | Tạo / liệt kê user (admin) |
-| GET | `/api/users/{user_id}` | Xem user |
-| GET | `/api/users/{username}/profile` | Profile kèm projects, tasks và task được giao |
-| POST / GET | `/api/projects` | Tạo / liệt kê project |
+| GET | `/api/users/{user_id}` | Thông tin user cơ bản, không trả email |
+| GET | `/api/users/{username}/profile` | Thông tin user cơ bản theo username, không lồng project/task |
+| POST / GET | `/api/projects` | Tạo / liệt kê project; GET hỗ trợ lọc `owner_id` |
 | GET | `/api/projects/{project_id}` | Xem project |
 | PATCH | `/api/projects/{project_id}` | Cập nhật một phần project |
 | GET / POST | `/api/projects/{project_id}/tasks` | Liệt kê / tạo task trong project, kèm assignee và tags |
-| POST / GET | `/api/tags` | Tạo / liệt kê tag |
-| PATCH | `/api/tags/{tag_id}` | Cập nhật tên tag |
-| POST / GET | `/api/tasks` | Tạo / liệt kê task |
+| POST / GET | `/api/tags` | Admin tạo / user đang hoạt động liệt kê tag |
+| PATCH | `/api/tags/{tag_id}` | Admin cập nhật tên tag |
+| POST / GET | `/api/tasks` | Tạo / liệt kê task; GET hỗ trợ lọc `assignee_id` |
 | GET / PATCH / DELETE | `/api/tasks/{task_id}` | Xem, cập nhật hoặc xóa task theo quyền |
 | POST | `/api/tasks/{task_id}/bookmark` | Bookmark task cho user đang đăng nhập |
+| DELETE | `/api/tasks/{task_id}/bookmark` | Bỏ bookmark của chính user đang đăng nhập; trả 204 |
 | POST | `/api/tasks/{task_id}/assign` | Giao lại task cho user (PM/Admin) |
 | POST | `/api/tasks/{task_id}/comments` | Thêm comment với tác giả từ JWT |
 | PATCH / DELETE | `/api/tasks/{task_id}/comments/{comment_id}` | Sửa / xóa comment (tác giả hoặc PM/Admin) |
 
-Các API danh sách task nhận `skip` (mặc định 0), `limit` (mặc định 20, tối đa 100),
-và vẫn hỗ trợ `offset` cũ. Danh sách User/Project/Tag dùng `offset` và `limit`.
-Task có bộ lọc `project_id`, `status` (`TODO`, `IN_PROGRESS`, `DONE`) và
+`GET /api/tasks` và `GET /api/projects/{project_id}/tasks` nhận `skip` (mặc định 0),
+`limit` (mặc định 20, tối đa 100), và vẫn hỗ trợ `offset` cũ. Danh sách User/Project/Tag
+dùng `offset` và `limit`; `GET /api/projects` nhận thêm bộ lọc `owner_id`.
+`GET /api/tasks` có bộ lọc `project_id`, `assignee_id`, `status` (`TODO`, `IN_PROGRESS`, `DONE`) và
 `priority` (`LOW`, `MEDIUM`, `HIGH`); xem Bài 5 bên dưới.
+
+Ba API danh sách Project/Task trả object phân trang:
+
+| Endpoint | Kiểu phần tử trong `items` |
+| --- | --- |
+| `GET /api/projects` | `ProjectRead` |
+| `GET /api/tasks` | `TaskRead` |
+| `GET /api/projects/{project_id}/tasks` | `TaskWithRelations` |
+
+Response gồm `items`, `total`, `offset`, `limit`. `total` là tổng số bản ghi
+khớp tất cả bộ lọc **trước phân trang**, không phải độ dài của `items`.
+Ví dụ có 23 kết quả, bỏ qua 40 bản ghi:
+
+```json
+{"items": [], "total": 23, "offset": 40, "limit": 20}
+```
+
+Trang đầu mặc định lấy tối đa 20 bản ghi. Trang cuối có thể ít hơn `limit`;
+trang vượt dữ liệu có `items: []` nhưng giữ nguyên `total`. Nếu không có kết quả
+khớp, `items: []` và `total: 0`. Metadata luôn dùng tên `offset`, kể cả khi
+request task dùng `skip`. Frontend đọc `page.items` và tính còn trang tiếp theo
+bằng `page.offset + page.items.length < page.total`. Dữ liệu có thể thay đổi
+giữa các lần tải trang.
+
+`GET /api/users` và `GET /api/tags` vẫn trả mảng trực tiếp; cache Tag giữ định
+dạng cũ. Các API tạo, chi tiết và cập nhật vẫn trả object tài nguyên như trước.
 
 Các API dữ liệu yêu cầu Bearer token. Trong Swagger UI, gọi
 `POST /api/users/register` trước:
@@ -166,21 +215,22 @@ Lấy `id` của Project, dùng khi tạo Task:
 }
 ```
 
-`assignee_id` và `due_date` có thể bỏ qua. Nếu gửi `due_date`, phải kèm múi giờ.
+`assignee_id` và `due_date` có thể bỏ qua. Nếu gửi `due_date`, phải kèm múi giờ
+và không được nằm trong quá khứ; hãy thay ngày trong ví dụ bằng deadline tương lai.
 Khi tạo task qua một trong hai endpoint, người được giao phải đang hoạt động;
 user không tồn tại trả 404, user bị khóa trả 409 và không lưu task.
 Priority nằm trong khoảng 1–5. API trả 201 khi tạo thành công, 404 khi không tìm
 thấy tài nguyên, 409 khi xung đột và 422 khi dữ liệu không hợp lệ.
 
 Phạm vi hiện tại: xác thực JWT, phân quyền admin/chủ project, tạo/xem User,
-Project, Task, Tag, bookmark/giao lại task, thêm/sửa/xóa comment, cập nhật
+Project, Task, Tag, thêm/bỏ bookmark, giao lại task, thêm/sửa/xóa comment, cập nhật
 Project/Tag và tài khoản hiện tại, cập nhật thông tin/trạng thái và xóa Task.
 Các API đọc project/task vẫn dùng chung cho tài khoản đang hoạt động;
 chưa có mô hình project riêng tư hoặc thành viên project. Chưa triển khai API
 xóa User/Project/Tag. Task hỗ trợ TODO → IN_PROGRESS → DONE qua PATCH;
 quyền và quy tắc chuyển trạng thái được mô tả trong Bài 6.
-Các đường dẫn `/tasks/...` cũ vẫn là ví dụ mock công khai,
-nằm trong `routers/examples.py`.
+Các đường dẫn mock `/tasks/...` cũ đã được gỡ và trả 404.
+Dùng API thật `/api/tasks` với Bearer token.
 
 ## Thực hành schema và Swagger UI
 
@@ -207,7 +257,7 @@ Chạy `make dev`, mở <http://127.0.0.1:8000/docs>, chọn endpoint rồi bấ
 2. Gọi `PATCH /api/projects/{project_id}` với `{"description": "Bài thực hành CRUD"}`.
    Gọi GET chi tiết để xác nhận tên và owner vẫn giữ nguyên. Thử tiếp
    `{"description": null}` để xóa mô tả.
-3. Gọi `POST /api/tags` với `{"name": "backend"}`. Sao chép `id` trả về và
+3. Đăng nhập bằng tài khoản admin, gọi `POST /api/tags` với `{"name": "backend"}`. Sao chép `id` trả về và
    gọi `PATCH /api/tags/{tag_id}` với `{"name": "frontend"}`.
 4. Gọi `GET /api/tags` với `offset=0`, `limit=20` để xem kết quả. Khi chưa tạo
    tag nào, danh sách trả `[]`.
@@ -215,6 +265,9 @@ Chạy `make dev`, mở <http://127.0.0.1:8000/docs>, chọn endpoint rồi bấ
    khi xem/sửa project hoặc sửa tag (404), và tạo/sửa tag trùng tên (409).
 
 Các schema gắn vào endpoint hiển thị trong mục **Schemas** của Swagger UI.
+Tag dùng chung toàn hệ thống; chỉ admin được tạo và đổi tên tag. User đang hoạt
+động được xem danh sách và sử dụng tag có sẵn khi tạo task trong project mình quản lý.
+User thường gọi POST/PATCH tag nhận 403, kể cả khi là chủ project.
 `GET /api/projects`, `GET /api/projects/{project_id}` và `GET /api/tags`
 không nhận request body; dữ liệu đầu vào nằm ở path/query parameters.
 
@@ -235,7 +288,7 @@ Migration thêm `username` và giữ các dữ liệu/quan hệ cũ:
   chỉ gồm `a-z`, `0-9`, `_`. Username trùng trả 409.
 - Xem username đã cấp qua `GET /api/users`; `name` vẫn là tên hiển thị, có thể trùng.
 
-Trong Swagger, tạo user, project và tag, rồi gọi
+Trong Swagger, chuẩn bị user và project; dùng tài khoản admin tạo tag, rồi gọi
 `POST /api/projects/{project_id}/tasks` với body:
 
 ```json
@@ -255,16 +308,49 @@ Task cùng các liên kết tag được lưu trong một transaction.
 Gọi `GET /api/projects/{project_id}/tasks?offset=0&limit=20` để xem task kèm
 object `assignee` và mảng `tags`. Có thể lọc `status=TODO|IN_PROGRESS|DONE`.
 Danh sách vẫn phân trang theo task dù mỗi task có nhiều tag; project không tồn
-tại trả 404, project chưa có task trả `[]`.
+tại trả 404, project chưa có task trả page với `items: []`, `total: 0`.
 
-Gọi `GET /api/users/huy/profile` để xem `UserProfile`: thông tin user,
-`projects` (mỗi project chứa `tasks`) và `assigned_tasks`. Mỗi task chứa
-assignee và tags, nhưng không lồng ngược lại profile để tránh vòng tham chiếu.
-`projects` chỉ gồm project user sở hữu; `assigned_tasks` có thể thuộc project
-người khác. Endpoint profile trả toàn bộ các collection này, chưa phân trang;
-với dữ liệu lớn nên dùng endpoint danh sách task theo project.
+Gọi `GET /api/users/huy/profile` hoặc `GET /api/users/{user_id}` để xem
+`UserSummary`, chỉ gồm `id`, `created_at`, `name`, `username`. Hai endpoint này
+không trả `email`, `role`, `is_active` hoặc các collection project/task.
+Username được chuẩn hóa chữ thường. `/api/users/me` vẫn trả thông tin đầy đủ của
+chính người đăng nhập; danh sách `/api/users` chỉ cho admin và vẫn có email.
 
-Trong `crud/tasks.py`, eager loading được khai báo bằng:
+Lấy `id` từ profile để lọc trên các API danh sách hiện có:
+
+```http
+GET /api/projects?owner_id=<UUID>&offset=0&limit=20
+GET /api/projects?owner_id=<UUID>&offset=20&limit=20
+GET /api/tasks?assignee_id=<UUID>&skip=0&limit=20
+GET /api/tasks?assignee_id=<UUID>&status=TODO&priority=HIGH
+GET /api/projects/{project_id}/tasks?skip=0&limit=20
+```
+
+- `/api/projects?owner_id=...` trả `Page[ProjectRead]` của các project user sở hữu,
+  không lồng `tasks`. Bỏ `owner_id` để lấy danh sách project không lọc theo owner.
+- `/api/tasks?assignee_id=...` trả `Page[TaskRead]` được giao cho user, kể cả task
+  thuộc project người khác. Mỗi phần tử trong `items` có `assignee_id`, không lồng `assignee` hoặc
+  `tags`. Bỏ `assignee_id` để lấy danh sách không lọc theo người được giao, gồm cả
+  task chưa giao. Có thể kết hợp `project_id`, `status`, `priority` bằng AND.
+- Project dùng `offset`, task dùng `skip` (đều mặc định 0, tối thiểu 0).
+  `limit` mặc định 20, từ 1 đến 100. Task vẫn nhận `offset` cũ; gửi cả `skip`
+  khác 0 và `offset` khác nhau trả 422. Tham số sai định dạng/giới hạn trả 422.
+- Dữ liệu được lọc theo user, sắp xếp theo `created_at`, `id`, rồi phân trang
+  ngay trong SQL. Response có `items`, `total`, `offset`, `limit`.
+- UUID hợp lệ nhưng user không tồn tại, không có dữ liệu khớp hoặc trang vượt
+  số bản ghi đều trả 200 với `items: []`. `total` là 0 khi không có dữ liệu khớp,
+  nhưng vẫn giữ số kết quả khớp nếu chỉ vượt trang. UUID sai định dạng trả 422. Các bộ lọc này
+  vẫn đọc được dữ liệu gắn với user bị khóa; không kiểm tra trạng thái user đích.
+
+Các endpoint đọc này cho phép mọi user đang hoạt động, giống quyền đọc project/task
+hiện có. Thiếu JWT hoặc JWT không hợp lệ trả 401; tài khoản bị khóa trả 403.
+Hai route `/api/users/{user_id}/projects` và `/api/users/{user_id}/assigned-tasks`
+đã được gỡ. Frontend dùng hai route này hoặc đọc `profile.projects`/
+`profile.assigned_tasks` cần chuyển sang API danh sách với bộ lọc tương ứng.
+Nếu cần task kèm `assignee` và `tags`, dùng `GET /api/projects/{project_id}/tasks`
+trả `Page[TaskWithRelations]` khi mở project.
+
+Trong `crud/tasks.py`, danh sách task theo project dùng eager loading:
 
 ```python
 select(Task).options(
@@ -279,18 +365,34 @@ một task có thể xuất hiện ở nhiều hàng SQL; `.unique()` gộp chú
 object Task. `raiseload("*")` báo lỗi nếu response vô tình truy cập relationship
 chưa tải, giúp phát hiện lazy loading ngoài dự kiến.
 
-Profile dùng `selectinload` cho các collection `User.projects`, `Project.tasks`
-và `User.assigned_tasks`, kết hợp `joinedload` assignee/tags của task. Cách này
-tránh nhân chéo số hàng giữa projects và assigned_tasks khi JOIN tất cả cùng lúc.
+Endpoint profile dùng `get_by_username()` để chỉ tải user. Danh sách project
+lọc theo `Project.owner_id`; danh sách task lọc theo `Task.assignee_id` trước
+phân trang. Hai danh sách này không tải relationship. Danh sách task theo project
+vẫn dùng `joinedload` assignee/tags và phân trang theo task.
 Tham khảo [SQLAlchemy Relationship Loading](https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html).
 
 Test truy vấn thay dependency xác thực bằng user giả để đo riêng nghiệp vụ,
 kể cả serialize response: với bộ dữ liệu
-1 và 12 phần tử, danh sách task theo project đều dùng **2 SELECT** (kiểm tra project
-+ tải tasks/assignee/tags), profile dùng **4 SELECT**. Với collection lớn hơn,
-`selectinload` có thể chia thành nhiều batch; số query tăng theo batch thay vì từng
-task. Khi dùng JWT thật, thêm một SELECT để lấy current user. Test cũng kiểm tra
-phân trang không mất tag hoặc lặp task.
+1 và 12 phần tử, danh sách task theo project dùng **3 SELECT** (kiểm tra project
++ đếm task + tải tasks/assignee/tags), profile dùng **1 SELECT**. Danh sách project/task
+có bộ lọc user dùng **2 SELECT** (đếm kết quả + tải trang dữ liệu), không truy vấn kiểm tra
+user đích hoặc tải quan hệ từng task. Khi dùng JWT thật, truy vấn xác thực
+current user cũng được tính thêm;
+SQLAlchemy có thể tái sử dụng user trong session khi đọc chính user đó.
+
+`tests/test_user_collections.py` kiểm tra 23 bản ghi với thời gian tạo trùng nhau,
+thứ tự ổn định, trang mặc định 20 bản ghi, lọc đúng user, trang cuối/rỗng và task
+có nhiều tag không bị lặp. `tests/test_filtering.py` kiểm tra `assignee_id`
+kết hợp với project/status/priority trước phân trang và `total` theo cùng bộ lọc.
+`tests/test_pagination.py` kiểm tra dependency chung, giới hạn tham số, tương thích
+`skip`/`offset`, giữ response mảng cho User/Tag và tổng task sau tạo/xóa.
+`tests/test_permissions.py` kiểm tra bằng JWT thật:
+không lộ email người khác, giữ quyền xem `/me` và danh sách admin, từ chối token
+sai và tài khoản bị khóa.
+
+```bash
+venv/bin/python -m pytest -q tests/test_pagination.py tests/test_user_collections.py tests/test_filtering.py tests/test_relationship_api.py tests/test_permissions.py tests/test_auth.py tests/test_api.py
+```
 
 ## Bài 4: JWT, OAuth2 và Dependency Injection
 
@@ -330,7 +432,7 @@ Ví dụ body cập nhật:
 
 Toàn bộ `/api/users`, `/api/projects`, `/api/tasks`, `/api/tags` được bảo vệ;
 chỉ `/api/users/register` và `/api/users/login` công khai trong nhóm `/api/`.
-`/docs`, `/openapi.json`, `/health` và mock examples vẫn công khai. Router auth
+`/docs`, `/openapi.json`, `/health` vẫn công khai. Router auth
 được đăng ký trước router user để `/me` không bị hiểu là `/{user_id}`.
 
 Thử bằng Swagger: đăng ký → **Authorize** → gọi `/me` → PUT đổi tên → GET kiểm tra.
@@ -351,7 +453,9 @@ Tham khảo [PyJWT claims validation](https://pyjwt.readthedocs.io/en/stable/api
 
 Các test auth dùng JWT và dependency thật, kiểm tra toàn bộ route được bảo vệ,
 token sai chữ ký/thuật toán/hết hạn/thiếu claim, không lộ hash, cập nhật đúng user,
-rollback khi trùng username/email và một luồng tạo project/tag/task đã đăng nhập.
+rollback khi trùng username/email và luồng user thường tạo project/task với tag có sẵn.
+Test phân quyền kiểm tra admin tạo/đổi tên tag, user thường chỉ đọc và sử dụng tag;
+admin bị khóa hoặc hạ role mất quyền ghi ngay cả khi JWT cũ còn hạn.
 Tham khảo [FastAPI OAuth2 JWT](https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/)
 và [bcrypt](https://github.com/pyca/bcrypt).
 
@@ -367,11 +471,26 @@ Các dependency trong `routers/dependencies.py`:
   cho toàn bộ API dữ liệu và `/me`. Tài khoản bị khóa nhận 403 ngay cả với token
   chưa hết hạn; đăng nhập bằng mật khẩu đúng cũng nhận 403.
 - `verify_admin_role`: chỉ cho role `ADMIN` tạo hồ sơ bằng `POST /api/users`
-  hoặc xem danh sách bằng `GET /api/users`. `/register` vẫn công khai.
+  hoặc xem danh sách bằng `GET /api/users`, tạo tag bằng `POST /api/tags` và
+  đổi tên tag bằng `PATCH /api/tags/{tag_id}`. `/register` vẫn công khai;
+  `GET /api/tags` cho phép mọi user đang hoạt động.
 - `verify_project_manager`: chủ sở hữu (`project.owner_id`) hoặc admin được
   sửa project và tạo task qua cả hai đường dẫn `/api/tasks` và
   `/api/projects/{project_id}/tasks`. User thường chỉ tạo project cho chính mình.
   Chủ project được chuyển quyền sở hữu; quyền quản lý chuyển sang chủ mới ngay.
+
+Khi tạo project (`POST /api/projects`) hoặc gửi `owner_id` để chuyển chủ sở hữu
+(`PATCH /api/projects/{project_id}`), owner phải tồn tại và đang hoạt động.
+Owner không tồn tại trả 404 (`Owner not found`); owner bị khóa trả 409
+(`Owner is inactive`), kể cả khi admin gửi request. Request bị từ chối không
+tạo project hoặc lưu bất kỳ trường cập nhật nào. PATCH không gửi `owner_id`
+vẫn cho phép admin sửa tên/mô tả của project có owner đã bị khóa.
+
+Chạy unit test kiểm tra owner và test tích hợp API/quyền với JWT thật:
+
+```bash
+venv/bin/python -m pytest tests/test_project_owners.py tests/test_permissions.py tests/test_api.py -q
+```
 
 Role và trạng thái hoạt động được đọc từ DB ở mỗi request. Các body đăng ký,
 tạo hồ sơ và sửa `/me` không cho phép truyền `role` hay `is_active`. Để thực hành
@@ -386,9 +505,16 @@ Thiếu JWT hoặc JWT không hợp lệ trả 401; thiếu quyền hoặc tài 
 
 ### Lọc và phân trang trực tiếp bằng Query Parameters
 
-Các hàm GET task khai báo trực tiếp `skip`, `limit`, `status`, `priority`.
+`routers/pagination.py` gom `DEFAULT_OFFSET = 0`, `DEFAULT_LIMIT = 20`,
+`MAX_LIMIT = 100` và validation query. `PaginationDep` dùng `Annotated`/`Depends`
+cho User/Project/Tag; `TaskPaginationDep` nhận `skip` và `offset` cũ cho hai
+danh sách task. Cả hai trả `Pagination(offset, limit)` để router dùng chung.
+`schemas/pagination.py` định nghĩa `Page[T]`; `crud/pagination.py` thực hiện
+COUNT trên truy vấn đã lọc rồi SELECT trang dữ liệu. Truy vấn COUNT không tải
+relationship nên task nhiều tag không làm tăng `total`.
+
 Các bộ lọc kết hợp bằng AND, chạy trước phân trang. Dữ liệu được sắp xếp theo
-`created_at`, rồi `id` để phân trang có thứ tự ổn định. Response vẫn là mảng task.
+`created_at`, rồi `id` để phân trang có thứ tự ổn định. Các phần tử nằm trong `items`.
 
 | Tham số | Giá trị |
 | --- | --- |
@@ -397,7 +523,12 @@ Các bộ lọc kết hợp bằng AND, chạy trước phân trang. Dữ liệu
 | `status` | `TODO`, `IN_PROGRESS`, `DONE`; bỏ qua để lấy mọi trạng thái |
 | `priority` | `LOW` = 1–2, `MEDIUM` = 3, `HIGH` = 4–5 |
 | `project_id` | UUID lọc project trên `GET /api/tasks` |
+| `assignee_id` | UUID lọc người được giao trên `GET /api/tasks`; kết hợp với các bộ lọc khác bằng AND |
 | `offset` | Tương thích API cũ; bị đánh dấu deprecated trong Swagger |
+
+`GET /api/projects` dùng `owner_id` tùy chọn để lọc chủ sở hữu, phân trang bằng
+`offset` và `limit`. Cả `owner_id` và `assignee_id` không có dữ liệu khớp đều trả
+page với `items: []`, `total: 0`.
 
 Body tạo task và response vẫn dùng priority số 1–5. Nếu có `offset`, nó thay
 `skip=0` mặc định; nếu `skip` khác 0 và khác `offset`, API trả 422.
@@ -413,6 +544,9 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8000/api/tasks/$TASK_ID/bookmark"
+
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8000/api/tasks/$TASK_ID/bookmark"
 ```
 
 Bookmark không cần body: user được lấy từ JWT, task lấy từ path. Thành công trả
@@ -420,10 +554,25 @@ Bookmark không cần body: user được lấy từ JWT, task lấy từ path. 
 tạo bản sao; hai user bookmark cùng task sẽ có hai bản ghi riêng. Mọi tài khoản
 đang hoạt động đều được bookmark task, không yêu cầu quyền quản lý project.
 
+`DELETE /api/tasks/{task_id}/bookmark` cũng không cần body, chỉ bỏ bookmark
+của user lấy từ JWT; không xóa task, bookmark của người khác hoặc bookmark
+của user đó trên task khác. Thành công trả 204, không có body. Nếu task còn
+tồn tại nhưng user chưa bookmark hoặc đã bỏ bookmark, vẫn trả 204; có thể
+gọi POST để bookmark lại. Admin cũng chỉ bỏ được bookmark của chính mình.
+Task không tồn tại trả 404; UUID không hợp lệ trả 422; thiếu/sai JWT trả 401;
+user bị khóa trả 403. Request bị từ chối không xóa bookmark.
+
 Các test mới kiểm tra quyền bằng JWT thật, chặn tự nâng quyền, thu hồi quyền khi
-đổi role/khóa tài khoản/chuyển chủ project, bookmark riêng từng user, xóa theo
+đổi role/khóa tài khoản/chuyển chủ project, thêm/bỏ bookmark riêng từng user, xóa theo
 khóa ngoại, bộ lọc kết hợp và phân trang sau khi lọc. Test migration kiểm tra
 schema và dữ liệu cũ trên SQLite tạm; không sửa database trong `.env`.
+
+Chạy unit test rollback khi bỏ bookmark, test API/quyền và kiểm tra router mock
+đã được gỡ khỏi ứng dụng/OpenAPI:
+
+```bash
+venv/bin/python -m pytest tests/test_bookmarks.py tests/test_permissions.py tests/test_api.py tests/test_auth.py -q
+```
 
 ## Bài 6: Nghiệp vụ tương tác task và Transaction
 
@@ -490,8 +639,10 @@ project không giữ quyền cũ. Tài khoản bị khóa vẫn bị từ chối
   endpoint `/assign` riêng để giao task.
 - Chuyển trạng thái theo TODO → IN_PROGRESS → DONE. Gửi lại trạng thái hiện tại
   là hợp lệ; bỏ qua một bước hoặc quay lùi trả 409, không lưu một phần body.
-  API tạo task giữ tương thích với các trạng thái đầu vào đã hỗ trợ; PATCH
-  áp dụng quy tắc trên từ trạng thái đang lưu.
+  Hai API `POST /api/tasks` và `POST /api/projects/{project_id}/tasks` không nhận
+  trường `status` (gửi vào trả 422); task mới luôn có trạng thái `TODO`.
+  Nếu cung cấp `due_date`, giá trị phải kèm timezone và không được nằm trong
+  quá khứ tại thời điểm tạo. PATCH vẫn cho phép deadline quá khứ.
 
 ```bash
 curl -X PATCH -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -711,7 +862,9 @@ const response = await fetch("http://localhost:8000/api/projects", {
   headers: { Authorization: `Bearer ${token}` },
 });
 console.log(response.headers.get("X-Request-ID"));
-const projects = await response.json();
+const page = await response.json();
+const projects = page.items;
+const hasNext = page.offset + projects.length < page.total;
 ```
 
 Không cần `credentials: "include"` vì API không dùng cookie để xác thực.
@@ -859,8 +1012,8 @@ không lưu dữ liệu; đã thêm hai regression test tái hiện lỗi trư�
 
 **Giới hạn còn lại:** chưa có API xóa User/Project/Tag; project/task vẫn được đọc chung bởi
 các tài khoản đang hoạt động. Đây là phạm vi ứng dụng học tập hiện có, chưa phải
-quy trình quản lý task đầy đủ cho nhiều nhóm riêng tư. Profile chưa phân trang,
-chưa có refresh token/thu hồi token và chưa kiểm thử tải lớn.
+quy trình quản lý task đầy đủ cho nhiều nhóm riêng tư. Chưa có refresh token/thu hồi
+token và chưa kiểm thử tải lớn.
 `/health` vẫn chỉ là liveness; khi DB dừng, endpoint
 này vẫn trả 200. TLS/domain và backup trên server thật chưa được kiểm chứng.
 
@@ -1028,12 +1181,15 @@ Schema chỉ được tạo bằng Alembic, không tự `create_all()` khi khở
 Sau khi thay đổi model:
 
 ```bash
-alembic revision --autogenerate -m "describe model change"
+make migration m="describe model change"
 # Đọc và kiểm tra file migration vừa sinh trước khi áp dụng.
 alembic upgrade head
 alembic check
 python3 -m pytest -q
 ```
+
+`make migration` dùng Python trong `venv` và yêu cầu mô tả qua `m="..."`.
+Lệnh chỉ sinh file migration, chưa áp dụng thay đổi vào database.
 
 Test tự tạo SQLite tạm, chạy migration thật, bật khóa ngoại và không sử dụng DB
 trong `.env`. SQLite không bảo toàn timezone như PostgreSQL. Migration có

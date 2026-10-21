@@ -5,10 +5,11 @@ from uuid import UUID
 import bcrypt
 import jwt
 
+import error_messages as errors
 from config import ACCESS_TOKEN_EXPIRE_MINUTES, JWT_IAT_LEEWAY_SECONDS, JWT_SECRET_KEY
 
 if len(JWT_SECRET_KEY.encode("utf-8")) < 32:
-    raise RuntimeError("Set JWT_SECRET_KEY to a random secret of at least 32 bytes in .env.")
+    raise RuntimeError(errors.INVALID_JWT_SECRET)
 
 ALGORITHM = "HS256"
 logger = logging.getLogger("taskhub.auth")
@@ -50,9 +51,9 @@ def decode_access_token(token: str) -> UUID:
     )
     issued_at = payload["iat"]
     if not isinstance(issued_at, int) or isinstance(issued_at, bool):
-        raise jwt.InvalidIssuedAtError("Issued At claim (iat) must be an integer.")
+        raise jwt.InvalidIssuedAtError(errors.JWT_IAT_NOT_INTEGER)
     skew = issued_at - datetime.now(UTC).timestamp()
     if skew > JWT_IAT_LEEWAY_SECONDS:
         logger.warning("JWT issued in future: clock_skew_seconds=%.3f", skew)
-        raise jwt.ImmatureSignatureError("The token is not yet valid (iat)")
+        raise jwt.ImmatureSignatureError(errors.JWT_IAT_IN_FUTURE)
     return UUID(payload["sub"])

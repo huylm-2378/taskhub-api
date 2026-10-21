@@ -61,7 +61,7 @@ def test_assign_owner_admin_and_persisted_relations(context):
         with SessionLocal() as db:
             assert db.get(Task, ctx.task_id).assignee_id == ctx.users[target].id
         nested = ctx.client.get(f"/api/projects/{ctx.project_id}/tasks", headers=ctx.headers[actor]).json()
-        task = next(task for task in nested if task["id"] == str(ctx.task_id))
+        task = next(task for task in nested["items"] if task["id"] == str(ctx.task_id))
         assert task["assignee"]["id"] == body["assignee_id"]
 
 
@@ -269,7 +269,8 @@ def test_task_status_lifecycle_and_invalid_transitions(context, actor):
     for status in ("TODO", "IN_PROGRESS"):
         assert ctx.client.patch(path, headers=headers, json={"status": status}).status_code == 409
     listed = ctx.client.get("/api/tasks", headers=headers, params={"status": "DONE"}).json()
-    assert [task["id"] for task in listed] == [str(ctx.task_id)]
+    assert [task["id"] for task in listed["items"]] == [str(ctx.task_id)]
+    assert listed["total"] == 1
 
 
 def test_task_partial_update_and_assignment_permissions(context):

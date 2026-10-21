@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from config import ACCESS_TOKEN_EXPIRE_MINUTES, JWT_SECRET_KEY
 from database import SessionLocal
-from models import User
+from models import Tag, User
 from security import ALGORITHM, create_access_token, verify_password
 
 PASSWORD = "a valid password!"
@@ -71,7 +71,9 @@ def test_update_me_only_changes_current_user_and_token_survives_rename(anonymous
     updated = {**user, "name": "Huy Updated", "username": "new_huy"}
     assert response.json() == updated
     assert client.get("/api/users/me", headers=headers).json() == updated
-    assert client.get(f"/api/users/{other['id']}", headers=headers).json() == other
+    assert client.get(f"/api/users/{other['id']}", headers=headers).json() == {
+        key: other[key] for key in ("id", "created_at", "name", "username")
+    }
     assert client.put("/api/users/me", headers=headers, json={}).json() == updated
     assert login(client).status_code == 401
     assert login(client, username="new_huy").status_code == 200
@@ -208,12 +210,20 @@ def test_authenticated_taskhub_workflow(anonymous_client):
     project_response = client.post("/api/projects", headers=headers, json={"name": "Private", "owner_id": user["id"]})
     assert project_response.status_code == 201, project_response.text
     project = project_response.json()
-    tag_response = client.post("/api/tags", headers=headers, json={"name": "backend"})
-    assert tag_response.status_code == 201
+    # Seed the shared catalog; this workflow stays authenticated as a regular user.
+    with SessionLocal() as db:
+        tag = Tag(name="backend")
+        db.add(tag)
+        db.commit()
+        tag_id = str(tag.id)
+    tags_response = client.get("/api/tags", headers=headers)
+    assert tags_response.status_code == 200
+    assert [tag["id"] for tag in tags_response.json()] == [tag_id]
     response = client.post(f"/api/projects/{project['id']}/tasks", headers=headers, json={
-        "title": "Authenticated task", "assignee_id": user["id"], "tag_ids": [tag_response.json()["id"]],
+        "title": "Authenticated task", "assignee_id": user["id"], "tag_ids": [tag_id],
     })
     assert response.status_code == 201, response.text
+    assert response.json()["tags"] == tags_response.json()
     assert "hashed_password" not in response.text
     assert client.get("/api/tasks", headers=headers).status_code == 200
     assert client.get(f"/api/projects/{project['id']}/tasks", headers=headers).status_code == 200

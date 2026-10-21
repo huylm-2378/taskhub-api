@@ -2,8 +2,9 @@ from uuid import uuid4
 
 from pydantic import ConfigDict, EmailStr, Field, SecretStr, field_validator
 
-from schemas.base import InputSchema, ReadSchema
+import error_messages as errors
 from models.user import UserRole
+from schemas.base import InputSchema, ReadSchema
 
 
 class UserCreate(InputSchema):
@@ -11,7 +12,9 @@ class UserCreate(InputSchema):
     email: EmailStr = Field(max_length=254)
     username: str = Field(
         default_factory=lambda: f"user_{uuid4().hex}",
-        min_length=3, max_length=64, pattern=r"^[a-z0-9_]+$",
+        min_length=3,
+        max_length=64,
+        pattern=r"^[a-z0-9_]+$",
     )
 
     @field_validator("username", mode="before")
@@ -26,6 +29,11 @@ class UserRead(ReadSchema):
     username: str
     is_active: bool
     role: UserRole
+
+
+class UserSummary(ReadSchema):
+    name: str
+    username: str
 
 
 class UserRegister(UserCreate):
@@ -43,14 +51,16 @@ class UserRegister(UserCreate):
     @classmethod
     def validate_password_bytes(cls, value: SecretStr) -> SecretStr:
         if len(value.get_secret_value().encode("utf-8")) > 72:
-            raise ValueError("Password must not exceed 72 UTF-8 bytes")
+            raise ValueError(errors.PASSWORD_TOO_MANY_BYTES)
         return value
 
 
 class UserUpdate(InputSchema):
     name: str | None = Field(default=None, min_length=1, max_length=100)
     email: EmailStr | None = Field(default=None, max_length=254)
-    username: str | None = Field(default=None, min_length=3, max_length=64, pattern=r"^[a-z0-9_]+$")
+    username: str | None = Field(
+        default=None, min_length=3, max_length=64, pattern=r"^[a-z0-9_]+$"
+    )
 
     @field_validator("username", mode="before")
     @classmethod
@@ -61,5 +71,5 @@ class UserUpdate(InputSchema):
     @classmethod
     def reject_null_fields(cls, value):
         if value is None:
-            raise ValueError("Field cannot be null")
+            raise ValueError(errors.FIELD_CANNOT_BE_NULL)
         return value

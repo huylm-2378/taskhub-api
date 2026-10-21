@@ -6,6 +6,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+import error_messages as errors
 from celery_app import celery_app
 from database import SessionLocal
 from models import Job
@@ -35,7 +36,7 @@ def create_job(db: Session, owner_id: UUID, kind: str, key: str, payload: dict) 
             if job is None:
                 raise
     if job.payload != payload:
-        raise IdempotencyConflict("Idempotency key already used with another payload")
+        raise IdempotencyConflict(errors.IDEMPOTENCY_KEY_CONFLICT)
     return job
 
 
