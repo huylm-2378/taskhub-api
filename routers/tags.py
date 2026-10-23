@@ -7,6 +7,7 @@ import error_messages as errors
 from crud import tags
 from routers.dependencies import AdminUser, DBSession
 from routers.pagination import PaginationDep
+from schemas.pagination import Page
 from schemas.tag import TagCreate, TagRead, TagUpdate
 from services import tag_cache
 
@@ -36,13 +37,6 @@ def update_tag(tag_id: UUID, data: TagUpdate, db: DBSession, current_user: Admin
     return tag
 
 
-@router.get("", response_model=list[TagRead])
-def list_tags(
-    db: DBSession,
-    pagination: PaginationDep,
-):
-    return tag_cache.list_tags(
-        db,
-        pagination.offset,
-        pagination.limit,
-    )
+@router.get("", response_model=Page[TagRead])
+def list_tags(db: DBSession, pagination: PaginationDep):
+    return tag_cache.list_tags(db, pagination.offset, pagination.limit)

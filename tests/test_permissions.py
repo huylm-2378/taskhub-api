@@ -79,7 +79,7 @@ def test_global_tags_require_admin_for_writes(anonymous_client, actors):
         assert client.patch(path, headers=headers, json={"name": "Forbidden"}).status_code == 403
         listed = client.get("/api/tags", headers=headers)
         assert listed.status_code == 200
-        assert listed.json() == [tag]
+        assert listed.json() == {"items": [tag], "total": 1, "offset": 0, "limit": 20}
         # Project ownership permits using an existing global tag, not renaming it.
         response = client.post(f"/api/projects/{project['id']}/tasks", headers=headers, json={
             "title": "Tagged task", "tag_ids": [tag["id"]],
@@ -94,7 +94,9 @@ def test_global_tags_require_admin_for_writes(anonymous_client, actors):
     renamed = client.patch(path, headers=admin_headers, json={"name": "frontend"})
     assert renamed.status_code == 200, renamed.text
     assert renamed.json() == {**tag, "name": "frontend"}
-    assert client.get("/api/tags", headers=actors["owner"][1]).json() == [renamed.json()]
+    assert client.get("/api/tags", headers=actors["owner"][1]).json() == {
+        "items": [renamed.json()], "total": 1, "offset": 0, "limit": 20,
+    }
 
 
 @pytest.mark.parametrize("change", [{"role": UserRole.USER}, {"is_active": False}])
@@ -155,7 +157,8 @@ def test_user_summaries_and_collections_use_active_user_permissions(anonymous_cl
     assert client.get("/api/users", headers=other_headers).status_code == 403
     admin_list = client.get("/api/users", headers=actors["admin"][1])
     assert admin_list.status_code == 200
-    assert owner["email"] in {item["email"] for item in admin_list.json()}
+    assert owner["email"] in {item["email"] for item in admin_list.json()["items"]}
+    assert admin_list.json()["total"] == 3
     with SessionLocal() as db:
         db.get(User, UUID(owner["id"])).is_active = False
         db.commit()
@@ -283,7 +286,7 @@ def test_bookmark_auth_persistence_duplicates_and_user_isolation(anonymous_clien
         assert db.scalar(select(func.count()).select_from(Bookmark)) == 0
 
 
-def test_unbookmark_is_idempotent_and_isolated_by_user_and_task(anonymous_client, actors):
+def test_unbookmark_returns_404_when_missing_and_isolated_by_user_and_task(anonymous_client, actors):
     client = anonymous_client
     project = create_project(client, actors["owner"])
     task_ids = []
@@ -305,17 +308,20 @@ def test_unbookmark_is_idempotent_and_isolated_by_user_and_task(anonymous_client
     path = f"/api/tasks/{task_ids[0]}/bookmark"
     # An admin with no bookmark cannot delete anyone else's bookmark.
     response = client.delete(path, headers=actors["admin"][1])
-    assert response.status_code == 204
-    assert response.content == b""
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Bookmark not found"}
     with SessionLocal() as db:
         assert set(db.execute(select(Bookmark.user_id, Bookmark.task_id)).all()) == expected
 
     # A regular user who does not manage the project can remove their own bookmark.
     expected.remove((UUID(actors["other"][0]["id"]), task_ids[0]))
-    for _ in range(2):
+    for expected_status in (204, 404):
         response = client.delete(path, headers=actors["other"][1])
-        assert response.status_code == 204, response.text
-        assert response.content == b""
+        assert response.status_code == expected_status, response.text
+        if expected_status == 204:
+            assert response.content == b""
+        else:
+            assert response.json() == {"detail": "Bookmark not found"}
         with SessionLocal() as db:
             assert set(db.execute(select(Bookmark.user_id, Bookmark.task_id)).all()) == expected
             assert db.get(Task, task_ids[0]) is not None

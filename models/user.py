@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from sqlalchemy import Boolean, String, true
@@ -7,9 +8,11 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
 from models.base import EntityMixin
-from models.comment import Comment
-from models.project import Project
-from models.task import Task
+
+if TYPE_CHECKING:
+    from models.comment import Comment
+    from models.project import Project
+    from models.task import Task
 
 
 class UserRole(str, Enum):
