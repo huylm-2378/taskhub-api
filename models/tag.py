@@ -3,7 +3,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
 from models.base import EntityMixin
-
+from models.task import Task
 
 task_tags = Table(
     "task_tags",
@@ -17,4 +17,6 @@ class Tag(EntityMixin, Base):
     __tablename__ = "tags"
 
     name: Mapped[str] = mapped_column(String(50), unique=True)
-    tasks: Mapped[list["Task"]] = relationship(secondary=task_tags, back_populates="tags")
+    tasks: Mapped[list["Task"]] = relationship(
+        secondary=task_tags, back_populates="tags"
+    )

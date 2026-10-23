@@ -2,6 +2,7 @@ from uuid import UUID
 
 from pydantic import Field, field_validator
 
+import error_messages as errors
 from schemas.base import InputSchema, ReadSchema
 
 
@@ -20,7 +21,7 @@ class ProjectUpdate(InputSchema):
     @classmethod
     def reject_null_required_fields(cls, value):
         if value is None:
-            raise ValueError("Field cannot be null")
+            raise ValueError(errors.FIELD_CANNOT_BE_NULL)
         return value
 
 

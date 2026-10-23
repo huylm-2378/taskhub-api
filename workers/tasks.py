@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 import config
+import error_messages as errors
 from celery_app import celery_app
 from database import SessionLocal
 from models import Job, Project, Task, TaskStatus, User, UserRole
@@ -25,7 +26,7 @@ def export_workbook(db, job: Job) -> bytes:
     if owner is None or not owner.is_active or project is None or (
         owner.role != UserRole.ADMIN and project.owner_id != owner.id
     ):
-        raise PermissionError("Export permission no longer available")
+        raise PermissionError(errors.EXPORT_PERMISSION_UNAVAILABLE)
     workbook = Workbook(write_only=True)
     sheet = workbook.create_sheet("Tasks")
     sheet.append(["ID", "Title", "Status", "Priority", "Due date (UTC)", "Assignee ID"])
@@ -33,7 +34,7 @@ def export_workbook(db, job: Job) -> bytes:
     try:
         for index, task in enumerate(db.scalars(statement).yield_per(500)):
             if index >= MAX_EXPORT_ROWS:
-                raise ValueError("Export row limit exceeded")
+                raise ValueError(errors.EXPORT_ROW_LIMIT_EXCEEDED)
             values = [
                 str(task.id), task.title, task.status.value, task.priority,
                 task.due_date.isoformat() if task.due_date else "",

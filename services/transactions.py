@@ -6,6 +6,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
+import error_messages as errors
+
 
 @contextmanager
 def transaction(db: Session) -> Iterator[None]:
@@ -18,7 +20,7 @@ def transaction(db: Session) -> Iterator[None]:
         db.commit()
     except (IntegrityError, StaleDataError):
         db.rollback()
-        raise HTTPException(status_code=409, detail="Task data changed; retry the request") from None
+        raise HTTPException(status_code=409, detail=errors.TASK_DATA_CHANGED) from None
     except Exception:
         db.rollback()
         raise

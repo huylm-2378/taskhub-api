@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+import error_messages as errors
 from models import Job, User
 from routers.dependencies import ActiveUser, DBSession, verify_project_manager
 from schemas.job import ExportCreate, JobRead
@@ -26,7 +27,7 @@ def create_export(data: ExportCreate, db: DBSession, current_user: ActiveUser):
         raise HTTPException(status_code=409, detail=str(exc)) from None
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Job references changed; retry the request") from None
+        raise HTTPException(status_code=409, detail=errors.JOB_REFERENCES_CHANGED) from None
     jobs.try_dispatch(job.id)
     db.refresh(job)
     return job
@@ -35,7 +36,7 @@ def create_export(data: ExportCreate, db: DBSession, current_user: ActiveUser):
 def owned_job(job_id: UUID, db: Session, current_user: User) -> Job:
     job = db.get(Job, job_id)
     if job is None or job.owner_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(status_code=404, detail=errors.JOB_NOT_FOUND)
     if job.kind == "export":
         verify_project_manager(UUID(job.payload["project_id"]), current_user, db)
     return job
@@ -50,7 +51,7 @@ def get_job(job_id: UUID, db: DBSession, current_user: ActiveUser):
 def download_export(job_id: UUID, db: DBSession, current_user: ActiveUser):
     job = owned_job(job_id, db, current_user)
     if job.kind != "export" or job.status != "succeeded":
-        raise HTTPException(status_code=409, detail="Export is not ready")
+        raise HTTPException(status_code=409, detail=errors.EXPORT_NOT_READY)
     return Response(
         content=job.output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
