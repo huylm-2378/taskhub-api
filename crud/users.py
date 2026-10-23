@@ -1,11 +1,11 @@
 from uuid import UUID
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, raiseload, selectinload
+from sqlalchemy.orm import Session
 
 from crud.common import save
-from crud.tasks import task_relationship_options
-from models import Project, User
+from crud.pagination import paginate
+from models import User
 from schemas.user import UserCreate, UserRegister, UserUpdate
 
 
@@ -32,13 +32,5 @@ def get(db: Session, user_id: UUID) -> User | None:
 
 
 def list_users(db: Session, offset: int, limit: int):
-    return db.scalars(select(User).order_by(User.created_at, User.id).offset(offset).limit(limit)).all()
-
-
-def get_profile(db: Session, username: str) -> User | None:
-    statement = select(User).where(User.username == username.lower()).options(
-        selectinload(User.projects).selectinload(Project.tasks).options(*task_relationship_options()),
-        selectinload(User.assigned_tasks).options(*task_relationship_options()),
-        raiseload("*"),
-    )
-    return db.scalars(statement).one_or_none()
+    statement = select(User).order_by(User.created_at, User.id)
+    return paginate(db, statement, offset, limit)

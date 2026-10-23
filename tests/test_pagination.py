@@ -1,8 +1,10 @@
+from datetime import UTC, datetime
+
 import pytest
 from fastapi import HTTPException
 
 from database import SessionLocal
-from models import Project, User
+from models import Project, Tag, User
 from routers.pagination import Pagination, get_pagination, get_task_pagination
 
 
@@ -57,11 +59,52 @@ def test_task_pagination_aliases_and_boundaries(client, pagination_project, path
         assert response.json() == {"items": [], "total": 0, "offset": 5, "limit": 100}
 
 
-def test_user_and_tag_lists_keep_array_responses(client, pagination_project):
-    for path in ("/api/users", "/api/tags"):
-        response = client.get(path, params={"limit": 100})
+@pytest.mark.parametrize("collection", ["users", "tags"])
+def test_user_and_tag_pages_include_total_and_stable_order(client, collection):
+    path = f"/api/{collection}"
+    assert client.get(path).json() == {"items": [], "total": 0, "offset": 0, "limit": 20}
+
+    # Equal timestamps require the UUID tie-breaker to keep pages stable.
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    with SessionLocal() as db:
+        if collection == "users":
+            records = [User(name=f"User {i}", username=f"page_{i}",
+                            email=f"page_{i}@example.com", created_at=created_at)
+                       for i in range(5)]
+        else:
+            records = [Tag(name=f"Tag {i}", created_at=created_at) for i in range(5)]
+        db.add_all(records)
+        db.commit()
+        expected_ids = sorted(str(record.id) for record in records)
+
+    full_page = client.get(path).json()
+    assert full_page["total"] == 5
+    assert full_page["offset"] == 0 and full_page["limit"] == 20
+    assert [item["id"] for item in full_page["items"]] == expected_ids
+    for offset, limit in ((0, 2), (2, 2), (4, 2), (5, 2), (8, 2), (0, 100)):
+        response = client.get(path, params={"offset": offset, "limit": limit})
         assert response.status_code == 200
-        assert isinstance(response.json(), list)
+        assert response.json() == {
+            "items": full_page["items"][offset:offset + limit],
+            "total": 5, "offset": offset, "limit": limit,
+        }
+
+
+@pytest.mark.parametrize("collection", ["users", "tags"])
+def test_user_and_tag_total_tracks_api_creation(client, collection):
+    path = f"/api/{collection}"
+    assert client.get(path).json()["total"] == 0
+    payload = {"name": "Created"}
+    if collection == "users":
+        payload.update(username="created", email="created@example.com")
+    created = client.post(path, json=payload)
+    assert created.status_code == 201, created.text
+    assert client.get(path).json() == {
+        "items": [created.json()], "total": 1, "offset": 0, "limit": 20,
+    }
+    assert client.get(path, params={"offset": 1}).json() == {
+        "items": [], "total": 1, "offset": 1, "limit": 20,
+    }
 
 
 def test_task_total_tracks_create_and_delete(client, pagination_project):

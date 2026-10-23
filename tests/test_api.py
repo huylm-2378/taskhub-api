@@ -55,9 +55,9 @@ def test_create_and_read_workflow(client):
         )
         assert client.get(f"/api/{path}/{item['id']}").json() == expected
         listed = client.get(f"/api/{path}").json()
-        assert listed == ([item] if path == "users" else {
+        assert listed == {
             "items": [item], "total": 1, "offset": 0, "limit": 20,
-        })
+        }
     assert client.get("/api/tasks", params={"status": "DONE"}).json() == {"items": [], "total": 0, "offset": 0, "limit": 20}
     assert client.get("/api/tasks", params={"project_id": str(uuid4())}).json() == {"items": [], "total": 0, "offset": 0, "limit": 20}
     assert client.get("/api/tasks", params={"offset": 1}).json() == {"items": [], "total": 1, "offset": 1, "limit": 20}
@@ -69,7 +69,8 @@ def test_duplicate_email_returns_conflict_and_next_request_works(client):
         "/api/users", json={"name": "Other", "email": "huy@example.com"}
     )
     assert duplicate.status_code == 409
-    assert len(client.get("/api/users").json()) == 1
+    page = client.get("/api/users").json()
+    assert len(page["items"]) == page["total"] == 1
     assert (
         client.post(
             "/api/users", json={"name": "Other", "email": "other@example.com"}
@@ -186,10 +187,13 @@ def test_health_and_docs(anonymous_client):
     assert {"OAuth2PasswordBearer": []} in unbookmark["security"]
     assert "content" not in unbookmark["responses"]["204"]
     assert client.get("/docs").status_code == 200
-    tag_items = schema["paths"]["/api/tags"]["get"]["responses"]["200"]["content"][
-        "application/json"
-    ]["schema"]["items"]
-    assert tag_items["$ref"] == "#/components/schemas/TagRead"
+    for path, item_schema in (("users", "UserRead"), ("tags", "TagRead")):
+        response_schema = schema["paths"][f"/api/{path}"]["get"]["responses"]["200"][
+            "content"
+        ]["application/json"]["schema"]
+        page = schema["components"]["schemas"][response_schema["$ref"].split("/")[-1]]
+        assert set(page["required"]) == {"items", "total", "offset", "limit"}
+        assert page["properties"]["items"]["items"]["$ref"] == f"#/components/schemas/{item_schema}"
 
 
 @pytest.mark.parametrize("path", [
@@ -203,22 +207,23 @@ def test_mock_routes_are_removed(anonymous_client, path):
 
 
 def test_list_tags_with_pagination(client):
-    assert client.get("/api/tags").json() == []
+    assert client.get("/api/tags").json() == {"items": [], "total": 0, "offset": 0, "limit": 20}
     with SessionLocal() as db:
         db.add_all([Tag(name="backend"), Tag(name="urgent")])
         db.commit()
 
     response = client.get("/api/tags")
     assert response.status_code == 200
-    tags = response.json()
+    tags = response.json()["items"]
+    assert response.json() == {"items": tags, "total": 2, "offset": 0, "limit": 20}
     assert {tag["name"] for tag in tags} == {"backend", "urgent"}
     for tag in tags:
         assert UUID(tag["id"]).version == 4
         assert tag["created_at"]
         assert set(tag) == {"id", "created_at", "name"}
-    assert client.get("/api/tags?limit=1").json() == tags[:1]
-    assert client.get("/api/tags?offset=1&limit=1").json() == tags[1:]
-    assert client.get("/api/tags?offset=2").json() == []
+    assert client.get("/api/tags?limit=1").json() == {"items": tags[:1], "total": 2, "offset": 0, "limit": 1}
+    assert client.get("/api/tags?offset=1&limit=1").json() == {"items": tags[1:], "total": 2, "offset": 1, "limit": 1}
+    assert client.get("/api/tags?offset=2").json() == {"items": [], "total": 2, "offset": 2, "limit": 20}
 
 
 @pytest.mark.parametrize("query", ["offset=-1", "limit=0", "limit=101", "offset=abc"])
@@ -285,13 +290,17 @@ def test_create_update_tags_and_conflicts(client):
     other = other_response.json()
     path = f"/api/tags/{tag['id']}"
     assert client.patch(path, json={"name": "urgent"}).status_code == 409
-    assert client.get("/api/tags").json() == [tag, other]
+    assert client.get("/api/tags").json() == {
+        "items": [tag, other], "total": 2, "offset": 0, "limit": 20,
+    }
     response = client.patch(path, json={"name": " frontend "})
     assert response.status_code == 200
     updated = {**tag, "name": "frontend"}
     assert response.json() == updated
     assert client.patch(path, json={}).json() == updated
-    assert client.get("/api/tags").json() == [updated, other]
+    assert client.get("/api/tags").json() == {
+        "items": [updated, other], "total": 2, "offset": 0, "limit": 20,
+    }
 
 
 def test_invalid_tag_writes(client):
@@ -304,7 +313,9 @@ def test_invalid_tag_writes(client):
     ]:
         assert client.post("/api/tags", json=data).status_code == 422
         assert client.patch(f"/api/tags/{tag['id']}", json=data).status_code == 422
-    assert client.get("/api/tags").json() == [tag]
+    assert client.get("/api/tags").json() == {
+        "items": [tag], "total": 1, "offset": 0, "limit": 20,
+    }
     assert (
         client.patch(f"/api/tags/{uuid4()}", json={"name": "missing"}).status_code
         == 404

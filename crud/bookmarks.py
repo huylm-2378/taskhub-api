@@ -22,15 +22,17 @@ def create(db: Session, user_id: UUID, task_id: UUID) -> Bookmark:
         return existing
 
 
-def delete(db: Session, user_id: UUID, task_id: UUID) -> None:
+def delete(db: Session, user_id: UUID, task_id: UUID) -> bool:
     statement = sql_delete(Bookmark).where(
         Bookmark.user_id == user_id,
         Bookmark.task_id == task_id,
     )
 
     try:
-        db.execute(statement)
+        result = db.execute(statement)
+        deleted = result.rowcount > 0
         db.commit()
+        return deleted
     except SQLAlchemyError:
         db.rollback()
         raise

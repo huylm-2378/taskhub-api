@@ -7,6 +7,7 @@ import error_messages as errors
 from crud import users
 from routers.dependencies import AdminUser, DBSession
 from routers.pagination import PaginationDep
+from schemas.pagination import Page
 from schemas.user import UserCreate, UserRead, UserSummary
 
 router = APIRouter(prefix="/api/users", tags=["Users"])
@@ -20,16 +21,19 @@ def create_user(data: UserCreate, db: DBSession, current_user: AdminUser):
         raise HTTPException(status_code=409, detail=errors.EMAIL_OR_USERNAME_EXISTS) from None
 
 
-@router.get("", response_model=list[UserRead])
+@router.get("", response_model=Page[UserRead])
 def list_users(
     db: DBSession,
     current_user: AdminUser,
     pagination: PaginationDep,
 ):
-    return users.list_users(
-        db,
-        pagination.offset,
-        pagination.limit,
+    items, total = users.list_users(db, pagination.offset, pagination.limit)
+
+    return Page[UserRead](
+        items=items,
+        total=total,
+        offset=pagination.offset,
+        limit=pagination.limit,
     )
 
 

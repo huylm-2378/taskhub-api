@@ -106,7 +106,7 @@ Trong [crud/tags.py](../crud/tags.py), mỗi hàm làm một việc:
 | --- | --- |
 | `create()` | Tạo object Tag rồi lưu |
 | `get()` | Tìm theo ID, không có thì trả `None` |
-| `list_tags()` | Lấy một trang danh sách |
+| `list_tags()` | Trả `(items, total)`: một trang danh sách và tổng số tag |
 | `update()` | Sửa những trường client gửi |
 | `delete()` — cần bổ sung | Xóa bản ghi rồi commit |
 
@@ -141,22 +141,25 @@ changes = data.model_dump(exclude_unset=True)
 Khi lấy danh sách, phân trang ngay trong SQL:
 
 ```python
-statement = (
-    select(Tag)
-    .order_by(Tag.created_at, Tag.id)
-    .offset(offset)
-    .limit(limit)
-)
-return db.scalars(statement).all()
+from crud.pagination import paginate
+
+statement = select(Tag).order_by(Tag.created_at, Tag.id)
+return paginate(db, statement, offset, limit)
 ```
 
 `offset=20&limit=20` nghĩa là bỏ 20 bản ghi đầu và lấy tối đa 20 bản ghi tiếp theo. Không tải toàn bộ rồi cắt list bằng Python.
+
+Helper `paginate()` đếm tổng trước khi áp dụng offset/limit. Service cache tag
+chuyển kết quả thành `Page[TagRead]` gồm `items`, `total`, `offset`, `limit` và
+cache toàn bộ object này. Trang không có phần tử vẫn giữ đúng tổng số tag.
 
 ## 6. Router: nối request với CRUD
 
 Ví dụ từ [routers/tags.py](../routers/tags.py):
 
 ```python
+import error_messages as errors
+
 @router.post("", response_model=TagRead, status_code=201)
 def create_tag(data: TagCreate, db: DBSession, current_user: AdminUser):
     try:
@@ -164,7 +167,7 @@ def create_tag(data: TagCreate, db: DBSession, current_user: AdminUser):
     except IntegrityError:
         raise HTTPException(
             status_code=409,
-            detail="Tag name already exists",
+            detail=errors.TAG_NAME_EXISTS,
         ) from None
 
     tag_cache.invalidate()
@@ -182,7 +185,7 @@ Luồng các thao tác còn lại:
 
 ```text
 GET chi tiết: tìm tag → không có trả 404 → có thì trả 200
-GET danh sách: kiểm tra offset/limit → đọc cache hoặc DB → trả mảng
+GET danh sách: kiểm tra offset/limit → đọc cache hoặc DB → trả Page (items, total, offset, limit)
 PATCH: tìm tag → không có trả 404 → cập nhật → làm mới cache → trả 200
 DELETE: tìm tag → không có trả 404 → xóa, commit → làm mới cache → trả 204
 ```

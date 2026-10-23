@@ -218,12 +218,12 @@ def test_authenticated_taskhub_workflow(anonymous_client):
         tag_id = str(tag.id)
     tags_response = client.get("/api/tags", headers=headers)
     assert tags_response.status_code == 200
-    assert [tag["id"] for tag in tags_response.json()] == [tag_id]
+    assert [tag["id"] for tag in tags_response.json()["items"]] == [tag_id]
     response = client.post(f"/api/projects/{project['id']}/tasks", headers=headers, json={
         "title": "Authenticated task", "assignee_id": user["id"], "tag_ids": [tag_id],
     })
     assert response.status_code == 201, response.text
-    assert response.json()["tags"] == tags_response.json()
+    assert response.json()["tags"] == tags_response.json()["items"]
     assert "hashed_password" not in response.text
     assert client.get("/api/tasks", headers=headers).status_code == 200
     assert client.get(f"/api/projects/{project['id']}/tasks", headers=headers).status_code == 200

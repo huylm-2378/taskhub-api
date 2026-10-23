@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from crud.common import save
+from crud.pagination import paginate
 from models import Tag
 from schemas.tag import TagCreate, TagUpdate
 
@@ -29,4 +30,5 @@ def update(db: Session, tag: Tag, data: TagUpdate) -> Tag:
 
 
 def list_tags(db: Session, offset: int, limit: int):
-    return db.scalars(select(Tag).order_by(Tag.created_at, Tag.id).offset(offset).limit(limit)).all()
+    statement = select(Tag).order_by(Tag.created_at, Tag.id)
+    return paginate(db, statement, offset, limit)

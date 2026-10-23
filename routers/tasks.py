@@ -77,9 +77,18 @@ def unbookmark_task(
     current_user: ActiveUser,
 ):
     if tasks.get(db, task_id) is None:
-        raise HTTPException(status_code=404, detail=errors.TASK_NOT_FOUND)
+        raise HTTPException(
+            status_code=404,
+            detail=errors.TASK_NOT_FOUND,
+        )
 
-    bookmarks.delete(db, current_user.id, task_id)
+    deleted = bookmarks.delete(db, current_user.id, task_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail=errors.BOOKMARK_NOT_FOUND,
+        )
+
     return Response(status_code=204)
 
 

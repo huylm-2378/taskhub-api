@@ -148,7 +148,7 @@ nối tính riêng cho mỗi worker: `DB_POOL_SIZE + DB_MAX_OVERFLOW`. Dependenc
 | POST / GET | `/api/tasks` | Tạo / liệt kê task; GET hỗ trợ lọc `assignee_id` |
 | GET / PATCH / DELETE | `/api/tasks/{task_id}` | Xem, cập nhật hoặc xóa task theo quyền |
 | POST | `/api/tasks/{task_id}/bookmark` | Bookmark task cho user đang đăng nhập |
-| DELETE | `/api/tasks/{task_id}/bookmark` | Bỏ bookmark của chính user đang đăng nhập; trả 204 |
+| DELETE | `/api/tasks/{task_id}/bookmark` | Bỏ bookmark của chính user đang đăng nhập; trả 204, chưa bookmark trả 404 |
 | POST | `/api/tasks/{task_id}/assign` | Giao lại task cho user (PM/Admin) |
 | POST | `/api/tasks/{task_id}/comments` | Thêm comment với tác giả từ JWT |
 | PATCH / DELETE | `/api/tasks/{task_id}/comments/{comment_id}` | Sửa / xóa comment (tác giả hoặc PM/Admin) |
@@ -159,10 +159,12 @@ dùng `offset` và `limit`; `GET /api/projects` nhận thêm bộ lọc `owner_i
 `GET /api/tasks` có bộ lọc `project_id`, `assignee_id`, `status` (`TODO`, `IN_PROGRESS`, `DONE`) và
 `priority` (`LOW`, `MEDIUM`, `HIGH`); xem Bài 5 bên dưới.
 
-Ba API danh sách Project/Task trả object phân trang:
+Các API danh sách User/Tag/Project/Task cùng trả object phân trang `Page`:
 
 | Endpoint | Kiểu phần tử trong `items` |
 | --- | --- |
+| `GET /api/users` | `UserRead` (chỉ admin) |
+| `GET /api/tags` | `TagRead` |
 | `GET /api/projects` | `ProjectRead` |
 | `GET /api/tasks` | `TaskRead` |
 | `GET /api/projects/{project_id}/tasks` | `TaskWithRelations` |
@@ -182,8 +184,10 @@ request task dùng `skip`. Frontend đọc `page.items` và tính còn trang ti�
 bằng `page.offset + page.items.length < page.total`. Dữ liệu có thể thay đổi
 giữa các lần tải trang.
 
-`GET /api/users` và `GET /api/tags` vẫn trả mảng trực tiếp; cache Tag giữ định
-dạng cũ. Các API tạo, chi tiết và cập nhật vẫn trả object tài nguyên như trước.
+`GET /api/users` và `GET /api/tags` đã chuyển từ mảng trực tiếp sang `Page`;
+frontend cần đọc danh sách qua `response.items`. Cache Tag lưu cả trang gồm
+`items`, `total`, `offset`, `limit`. Các API tạo, chi tiết và cập nhật vẫn trả
+object tài nguyên như trước; mảng `tags` lồng trong task cũng không đổi.
 
 Các API dữ liệu yêu cầu Bearer token. Trong Swagger UI, gọi
 `POST /api/users/register` trước:
@@ -246,8 +250,9 @@ Project và Tag có ba schema riêng trong `schemas/project.py` và `schemas/tag
 
 Luồng một request: APIRouter nhận request → Pydantic kiểm tra đầu vào → hàm
 trong `crud/` truy vấn/cập nhật SQLAlchemy Model → database → schema Read → JSON.
-Ví dụ `GET /api/tags`: `routers/tags.py` → `crud/tags.py` → `models/tag.py`
-→ `TagRead`. Lỗi validation trả 422 trước khi chạy thân hàm endpoint.
+Ví dụ `GET /api/tags`: `routers/tags.py` → `services/tag_cache.py` → cache hoặc
+`crud/tags.py` → `models/tag.py` → `Page[TagRead]`. Lỗi validation trả 422
+trước khi chạy thân hàm endpoint.
 
 Chạy `make dev`, mở <http://127.0.0.1:8000/docs>, chọn endpoint rồi bấm
 **Try it out** → nhập tham số/body → **Execute**:
@@ -260,7 +265,7 @@ Chạy `make dev`, mở <http://127.0.0.1:8000/docs>, chọn endpoint rồi bấ
 3. Đăng nhập bằng tài khoản admin, gọi `POST /api/tags` với `{"name": "backend"}`. Sao chép `id` trả về và
    gọi `PATCH /api/tags/{tag_id}` với `{"name": "frontend"}`.
 4. Gọi `GET /api/tags` với `offset=0`, `limit=20` để xem kết quả. Khi chưa tạo
-   tag nào, danh sách trả `[]`.
+   tag nào, API trả `{"items": [], "total": 0, "offset": 0, "limit": 20}`.
 5. Thử tên rỗng hoặc UUID sai định dạng (422), UUID hợp lệ nhưng không tồn tại
    khi xem/sửa project hoặc sửa tag (404), và tạo/sửa tag trùng tên (409).
 
@@ -365,7 +370,11 @@ một task có thể xuất hiện ở nhiều hàng SQL; `.unique()` gộp chú
 object Task. `raiseload("*")` báo lỗi nếu response vô tình truy cập relationship
 chưa tải, giúp phát hiện lazy loading ngoài dự kiến.
 
-Endpoint profile dùng `get_by_username()` để chỉ tải user. Danh sách project
+Endpoint profile dùng `get_by_username()` để chỉ tải user; hàm `get_profile()`
+và `schemas/profile.py` cũ đã được xóa. Các import model chỉ dùng cho type hint
+trong `models/tag.py`, `models/user.py`, `models/task.py` nằm trong `TYPE_CHECKING`;
+`models/__init__.py` vẫn đăng ký đầy đủ model tại runtime để ORM resolve quan hệ.
+Danh sách project
 lọc theo `Project.owner_id`; danh sách task lọc theo `Task.assignee_id` trước
 phân trang. Hai danh sách này không tải relationship. Danh sách task theo project
 vẫn dùng `joinedload` assignee/tags và phân trang theo task.
@@ -385,7 +394,8 @@ thứ tự ổn định, trang mặc định 20 bản ghi, lọc đúng user, tr
 có nhiều tag không bị lặp. `tests/test_filtering.py` kiểm tra `assignee_id`
 kết hợp với project/status/priority trước phân trang và `total` theo cùng bộ lọc.
 `tests/test_pagination.py` kiểm tra dependency chung, giới hạn tham số, tương thích
-`skip`/`offset`, giữ response mảng cho User/Tag và tổng task sau tạo/xóa.
+`skip`/`offset`, response `Page` cho User/Tag, thứ tự ổn định khi trùng thời gian
+tạo, tổng bản ghi ở trang cuối/vượt dữ liệu và tổng task sau tạo/xóa.
 `tests/test_permissions.py` kiểm tra bằng JWT thật:
 không lộ email người khác, giữ quyền xem `/me` và danh sách admin, từ chối token
 sai và tài khoản bị khóa.
@@ -557,9 +567,10 @@ tạo bản sao; hai user bookmark cùng task sẽ có hai bản ghi riêng. M�
 `DELETE /api/tasks/{task_id}/bookmark` cũng không cần body, chỉ bỏ bookmark
 của user lấy từ JWT; không xóa task, bookmark của người khác hoặc bookmark
 của user đó trên task khác. Thành công trả 204, không có body. Nếu task còn
-tồn tại nhưng user chưa bookmark hoặc đã bỏ bookmark, vẫn trả 204; có thể
-gọi POST để bookmark lại. Admin cũng chỉ bỏ được bookmark của chính mình.
-Task không tồn tại trả 404; UUID không hợp lệ trả 422; thiếu/sai JWT trả 401;
+tồn tại nhưng user chưa bookmark hoặc đã bỏ bookmark, trả 404 với
+`"Bookmark not found"`; gọi xóa lần hai cũng trả lỗi này. Có thể gọi POST để
+bookmark lại. Admin cũng chỉ bỏ được bookmark của chính mình.
+Task không tồn tại trả 404 với `"Task not found"`; UUID không hợp lệ trả 422; thiếu/sai JWT trả 401;
 user bị khóa trả 403. Request bị từ chối không xóa bookmark.
 
 Các test mới kiểm tra quyền bằng JWT thật, chặn tự nâng quyền, thu hồi quyền khi
@@ -567,7 +578,7 @@ Các test mới kiểm tra quyền bằng JWT thật, chặn tự nâng quyền,
 khóa ngoại, bộ lọc kết hợp và phân trang sau khi lọc. Test migration kiểm tra
 schema và dữ liệu cũ trên SQLite tạm; không sửa database trong `.env`.
 
-Chạy unit test rollback khi bỏ bookmark, test API/quyền và kiểm tra router mock
+Chạy unit test kết quả xóa/rollback khi bỏ bookmark, test API/quyền và kiểm tra router mock
 đã được gỡ khỏi ứng dụng/OpenAPI:
 
 ```bash
@@ -819,8 +830,12 @@ và cập nhật URL cho khớp. `make dev` vẫn chỉ tự khởi động Post
 bằng `docker compose --profile cache stop redis`. Cache không cần lưu volume.
 Dùng prefix riêng cho từng môi trường nếu dùng chung một Redis database.
 
-`GET /api/tags?offset=0&limit=20` cache JSON theo từng cặp `offset/limit`, kể cả
-mảng rỗng, với TTL mặc định 60 giây. JWT và trạng thái tài khoản luôn được kiểm
+`GET /api/tags?offset=0&limit=20` cache JSON của toàn bộ `Page[TagRead]` theo từng
+cặp `offset/limit`, kể cả trang có `items: []`, với TTL mặc định 60 giây.
+Trang vượt dữ liệu vẫn giữ tổng số tag trong `total`. Key dữ liệu có dạng
+`{TAGS_CACHE_PREFIX}:page:v2:{generation}:{offset}:{limit}` để không đọc nhầm
+cache dạng mảng của phiên bản cũ; generation key vẫn được dùng chung cho invalidation.
+JWT và trạng thái tài khoản luôn được kiểm
 tra trước khi đọc cache. Tạo/sửa tag thành công mới vô hiệu hóa các trang cache;
 request thất bại giữ cache hiện tại. Cơ chế đổi mã phiên bản cache ngăn một
 request đọc cũ đang chạy ghi đè dữ liệu vào phiên bản mới; trang cũ tự hết hạn.
@@ -831,8 +846,9 @@ Redis là 0,2 giây mỗi thao tác, không retry. Nếu vô hiệu hóa cache t
 tag bị sửa trực tiếp trong DB, trang cũ có thể còn được đọc tới khi TTL hết hạn.
 Client Redis được đóng khi ứng dụng dừng.
 
-`tests/test_tag_cache.py` dùng `fakeredis` để kiểm tra cache hit/miss, phân trang,
-TTL, dữ liệu hỏng, invalidation, request đọc đang chạy, xác thực và Redis mất kết
+`tests/test_tag_cache.py` dùng `fakeredis` để kiểm tra cache hit/miss cùng trả
+`Page`, phân trang và `total`, TTL, dữ liệu hỏng, bỏ qua cache mảng cũ,
+invalidation, request đọc đang chạy, xác thực và Redis mất kết
 nối. Bộ test không cần Redis thật và không dùng SMTP/Redis từ `.env`.
 
 ```bash
